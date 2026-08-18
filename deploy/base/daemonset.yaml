@@ -1,0 +1,73 @@
+---
+# unifand: temperature-led fan control for the Lian Li UNI HUB SL V2.
+#
+# The base deliberately sets NO scheduling constraints — add a nodeSelector
+# via an overlay so the DaemonSet only lands on node(s) with the hub attached.
+# See deploy/overlays/nfd-usb (Node Feature Discovery) and
+# deploy/overlays/nodename for two worked examples, and
+# deploy/components/nvidia-gpu to enable GPU temperature via NVML.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: unifand
+  namespace: unifand
+  labels:
+    app.kubernetes.io/name: unifand
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: unifand
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: unifand
+    spec:
+      terminationGracePeriodSeconds: 15
+      # The daemon never talks to the Kubernetes API — the default SA token
+      # is unused attack surface on an already-privileged pod.
+      automountServiceAccountToken: false
+      # Outranks ordinary workloads: this is a node thermal-safety daemon,
+      # not an application. Under node pressure it must be evicted last (or
+      # not at all) — the invariant "daemon-down must never mean fans-at-idle
+      # under load" only holds if the daemon keeps running.
+      priorityClassName: unifand-critical
+      containers:
+        - name: unifand
+          image: ghcr.io/charliesu/unifand:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/unifand/config.toml"]
+          ports:
+            - name: metrics
+              containerPort: 9877
+          securityContext:
+            # Required for /dev/hidraw* access via the hostPath mount.
+            privileged: true
+            # The daemon writes no files: config is a read-only mount and
+            # hidraw/NVML I/O go through /dev and dlopen'd libraries, not the
+            # container filesystem. All state is in memory; logs go to stdout.
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: dev
+              mountPath: /dev
+            - name: config
+              mountPath: /etc/unifand
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: config
+          configMap:
+            name: unifand-config

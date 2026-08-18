@@ -1,0 +1,30 @@
+# For: prometheus-operator (https://github.com/prometheus-operator/prometheus-operator)
+#
+# A PodMonitor, not a ServiceMonitor: unifand is a privileged hostPath
+# DaemonSet with no Service in front of it (there's nothing to load-balance
+# — one pod per node, each scraped independently), so PodMonitor is the
+# right CRD shape. Matches the pod label app.kubernetes.io/name: unifand
+# and the DaemonSet's named container port "metrics" (9877).
+#
+# Add a `release: <your-prometheus-operator-release>` (or whatever label
+# your PrometheusSpec.podMonitorSelector matches on) if your operator
+# doesn't watch all namespaces/PodMonitors by default.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: unifand
+  namespace: unifand
+  labels:
+    app.kubernetes.io/name: unifand
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: unifand
+  namespaceSelector:
+    matchNames:
+      - unifand
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

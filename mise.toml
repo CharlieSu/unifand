@@ -1,0 +1,17 @@
+[tools]
+rust = "1.97.1"
+
+[tasks.build]
+run = "cargo build"
+
+[tasks.test]
+run = "cargo test"
+
+[tasks.release]
+run = "cargo build --release"
+
+[tasks.fmt]
+run = "cargo fmt --check"
+
+[tasks.clippy]
+run = "cargo clippy --all-targets -- -D warnings"

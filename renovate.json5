@@ -1,0 +1,88 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:recommended",
+    // Maintain (not remove) the SHA pins on GitHub Actions: Renovate updates
+    // the digest and keeps the "# vX.Y.Z" comment in sync. This is the
+    // OpenSSF-recommended posture — immune to tag-moving attacks
+    // (tj-actions/changed-files, 2025) while staying current via PRs.
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommits",
+  ],
+  timezone: "America/Denver",
+  dependencyDashboard: true,
+  labels: ["renovate"],
+
+  // Aggressive flow (same posture as CharlieSu/charles.dev): no PR throttling,
+  // keep branches rebased, but give upstream releases a 3-day soak before
+  // PRing them — cheap insurance against compromised or yanked releases,
+  // which matters for a privileged daemon. Vulnerability-driven PRs bypass
+  // the soak and get labeled.
+  prHourlyLimit: 0,
+  prConcurrentLimit: 0,
+  rebaseWhen: "behind-base-branch",
+  minimumReleaseAge: "3 days",
+  vulnerabilityAlerts: { labels: ["security"] },
+
+  // Managers active for this repo (all built-in):
+  //   cargo          — Cargo.toml deps + Cargo.lock
+  //   github-actions — .github/workflows/* (SHA pins per the preset above)
+  //   mise           — mise.toml [tools] (rust)
+  //   dockerfile     — digest-pinned FROM lines (updates tag+digest together)
+
+  // Refresh transitive deps (Cargo.lock) monthly even without manifest bumps.
+  lockFileMaintenance: { enabled: true, schedule: ["before 6am on the first day of the month"] },
+
+  packageRules: [
+    {
+      // The Rust toolchain is pinned in four places that must move together:
+      // mise.toml, the Dockerfile builder image, and CI's `toolchain:` input
+      // (custom manager below). Group them into a single PR.
+      groupName: "rust toolchain",
+      matchPackageNames: ["rust", "rust-lang/rust"],
+      matchManagers: ["mise", "dockerfile", "custom.regex"],
+    },
+    {
+      groupName: "github-actions",
+      matchManagers: ["github-actions"],
+      matchUpdateTypes: ["minor", "patch", "digest", "pinDigest"],
+    },
+    {
+      // Auto-merge everything non-major once CI is green — the PR gauntlet
+      // (fmt, clippy -D warnings, tests, cargo-audit + cargo-deny) is the
+      // reviewer. Deliberately NOT platformAutomerge: this repo has no branch
+      // protection, so Renovate itself waits for passing checks and merges.
+      matchUpdateTypes: ["patch", "minor", "pin", "digest", "pinDigest", "lockFileMaintenance"],
+      automerge: true,
+    },
+    {
+      // Exception: Rust toolchain minors/majors wait for a human — a
+      // toolchain bump rebuilds the world and can change clippy's verdicts,
+      // and the four-way pin sync deserves eyes. Toolchain patches still
+      // automerge via the rule above.
+      matchPackageNames: ["rust", "rust-lang/rust"],
+      matchUpdateTypes: ["minor", "major"],
+      automerge: false,
+    },
+  ],
+
+  customManagers: [
+    {
+      // CI pins the Rust toolchain as an action input (dtolnay/rust-toolchain
+      // `toolchain: 1.97.1`) — no built-in manager covers it.
+      customType: "regex",
+      fileMatch: ["^\\.github/workflows/.+\\.ya?ml$"],
+      matchStrings: ["toolchain:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      depNameTemplate: "rust",
+      packageNameTemplate: "rust-lang/rust",
+      datasourceTemplate: "github-releases",
+      extractVersionTemplate: "^(?<version>.+)$",
+    },
+  ],
+
+  // NOT managed here on purpose:
+  // - Cargo.toml `rust-version` (MSRV) — a compatibility policy statement,
+  //   bumped deliberately, not chased to latest.
+  // - deploy/base image tag — the git tree ships an unpinned template; the
+  //   release artifact carries the digest pin (set by CI at tag time).
+}

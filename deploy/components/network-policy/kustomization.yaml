@@ -1,0 +1,23 @@
+---
+# Optional component: restrict ingress to the metrics/health port (9877)
+# to namespaces you label as trusted scrapers. Not wired into any base or
+# overlay by default — without a monitoring stack, an ingress-only
+# NetworkPolicy is dead weight, and the placeholder namespace label inside
+# networkpolicy.yaml matches nothing until you edit it.
+#
+# To enable, add this component's path to your own kustomization's
+# `components:` list alongside `deploy/base` (or an overlay built on it),
+# e.g.:
+#
+#   resources:
+#     - ../../base
+#   components:
+#     - ../../components/network-policy
+#
+# Then either patch networkpolicy.yaml's namespaceSelector to match your
+# monitoring namespace's real label, or apply that label to the namespace
+# yourself (e.g. `kubectl label ns monitoring monitoring.example.com/scrape=true`).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - networkpolicy.yaml

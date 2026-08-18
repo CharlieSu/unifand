@@ -1,0 +1,15 @@
+---
+# Optional component: GPU temperature via NVML.
+#
+# Requires the NVIDIA container toolkit's `nvidia` RuntimeClass on the node
+# (GPU Operator or equivalent). unifand dlopens the injected libnvidia-ml
+# for temperature ONLY — it never claims the nvidia.com/gpu resource, so
+# your GPU workloads keep full use of the card. Without this component
+# unifand runs CPU-only (and exports unifand_degraded = 1).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - path: patch.yaml
+    target:
+      kind: DaemonSet
+      name: unifand

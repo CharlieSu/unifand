@@ -1,0 +1,15 @@
+---
+# Simplest possible scheduling: pin unifand to one named node.
+# Replace the hostname in patch.yaml with the node your hub is plugged into.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - path: patch.yaml
+    target:
+      kind: DaemonSet
+      name: unifand
+# GPU temperature via NVML? Uncomment:
+# components:
+#   - ../../components/nvidia-gpu

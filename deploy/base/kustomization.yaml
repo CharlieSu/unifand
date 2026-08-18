@@ -1,0 +1,21 @@
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - priorityclass.yaml
+  - daemonset.yaml
+
+# The config file becomes the unifand-config ConfigMap. Edit config.toml
+# (or point `files` at your own copy); the generated name hash changes on
+# edit, so the DaemonSet rolls automatically.
+configMapGenerator:
+  - name: unifand-config
+    namespace: unifand
+    files:
+      - config.toml
+
+# Pin/override the image version here or in an overlay:
+#   kustomize edit set image ghcr.io/charliesu/unifand:vX.Y.Z
+images:
+  - name: ghcr.io/charliesu/unifand

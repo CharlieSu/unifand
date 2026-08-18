@@ -1,0 +1,30 @@
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: rp
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      # Tags created here use GITHUB_TOKEN, and GitHub deliberately does not
+      # fire push/tag-triggered workflows for GITHUB_TOKEN-created refs (the
+      # recursive-workflow guard). workflow_dispatch is the documented
+      # exception, so kick the release build explicitly at the new tag —
+      # ci.yaml's tag-gated jobs see refs/tags/vX.Y.Z exactly as if the tag
+      # had been pushed by hand.
+      - name: Trigger release build at the new tag
+        if: ${{ steps.rp.outputs.release_created }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yaml --repo "$GITHUB_REPOSITORY" --ref "${{ steps.rp.outputs.tag_name }}"

@@ -1,0 +1,24 @@
+# For: VictoriaMetrics operator (https://github.com/VictoriaMetrics/operator)
+#
+# Same shape as a PodMonitor (VMPodScrape is VictoriaMetrics's equivalent
+# CRD) — no Service in front of the DaemonSet, so this scrapes pods
+# directly by label. This is the exact pattern already running against
+# unifand in production (adjust `namespace: victoria-metrics` below to
+# wherever your VMAgent/VMPodScrape objects live if different).
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: unifand
+  namespace: victoria-metrics
+spec:
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: unifand
+  namespaceSelector:
+    matchNames:
+      - unifand

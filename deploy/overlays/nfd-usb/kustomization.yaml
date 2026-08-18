@@ -1,0 +1,27 @@
+---
+# Schedule unifand wherever Node Feature Discovery (NFD) sees the SL V2 hub.
+#
+# NFD publishes a label per detected USB device. For the UNI HUB SL V2
+# (vendor 0cf2, product a105) it looks like:
+#
+#   feature.node.kubernetes.io/usb-ff_0cf2_a105_<hub-serial>.present: "true"
+#
+# NOTE the label embeds YOUR hub's serial number. Find yours with:
+#
+#   kubectl get nodes -o json | grep -o 'usb-ff_0cf2_a105[^"]*'
+#
+# then replace the label key in patch.yaml. (NFD must be configured to
+# discover USB devices — see the NFD worker config `sources.usb`.)
+# A replacement hub changes the serial, and therefore the label.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - path: patch.yaml
+    target:
+      kind: DaemonSet
+      name: unifand
+# GPU temperature via NVML? Uncomment:
+# components:
+#   - ../../components/nvidia-gpu

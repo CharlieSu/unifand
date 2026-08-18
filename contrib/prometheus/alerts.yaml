@@ -1,0 +1,125 @@
+# unifand alerting rules — plain Prometheus / prometheus-operator PrometheusRule
+# body / VictoriaMetrics VMRule body (the `groups:` shape below is identical
+# across all three; wrap it in the CRD envelope your operator expects, e.g.:
+#
+#   apiVersion: monitoring.coreos.com/v1
+#   kind: PrometheusRule
+#   metadata:
+#     name: unifand
+#     namespace: unifand
+#     labels: {release: kube-prometheus-stack}   # match your operator's ruleSelector
+#   spec:
+#     <paste groups: below>
+#
+#   apiVersion: operator.victoriametrics.com/v1beta1
+#   kind: VMRule
+#   metadata:
+#     name: unifand
+#     namespace: unifand
+#   spec:
+#     <paste groups: below>
+#
+# For a standalone Prometheus, drop this file (as-is) into a `rule_files:`
+# path referenced from prometheus.yml.
+#
+# Metric names/labels verified against src/metrics.rs at unifand v0.4.0:
+# unifand_build_info{version}, unifand_last_tick_timestamp_seconds,
+# unifand_hub_present, unifand_degraded, unifand_fallback_active,
+# unifand_hid_errors_total{kind="read"|"write"}.
+groups:
+  - name: unifand
+    rules:
+      - alert: UnifandAbsent
+        expr: absent(unifand_build_info)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "unifand is not being scraped"
+          description: >-
+            No unifand_build_info series has been seen for 5 minutes.
+            absent() carries no labels from the missing series, so this
+            fires with no per-instance identity — check every configured
+            target. Either the scrape target is gone (pod crashed/evicted,
+            DaemonSet not scheduled) or the scrape config itself is
+            broken. Check `kubectl get pods -n unifand` and the
+            DaemonSet's node scheduling (see README Troubleshooting: "0/0
+            DaemonSet, nodeSelector mismatch").
+
+      - alert: UnifandStuck
+        expr: time() - unifand_last_tick_timestamp_seconds > 60
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "unifand control loop is stuck on {{ $labels.instance }}"
+          description: >-
+            unifand_last_tick_timestamp_seconds has not advanced in over 60s.
+            The metrics HTTP thread is independent of the control loop, so
+            this is the only reliable signal that the loop itself is wedged
+            (a hung HID read/write, a deadlock, or similar) — /metrics can
+            keep serving stale-but-plausible numbers forever otherwise. The
+            DaemonSet's /healthz livenessProbe uses the same signal (3x
+            poll_interval_secs) and should already be restarting the pod;
+            if this alert is firing continuously, the restart isn't
+            recovering — check `kubectl logs` for a crash loop.
+
+      - alert: UnifandHubMissing
+        expr: unifand_hub_present == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "unifand hub not found on {{ $labels.instance }}"
+          description: >-
+            unifand_hub_present has been 0 for 5 minutes. The daemon is
+            running and waiting (this is expected, not a crash, as of
+            v0.4.0) but no SL V2 hub has been found at /dev/hidraw*. Check
+            that the hub is plugged into this node, the USB ID is
+            0cf2:a105, and (if using the nfd-usb overlay) that the NFD
+            label hasn't drifted after a hub swap.
+
+      - alert: UnifandDegraded
+        expr: unifand_degraded == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "unifand running without a GPU sensor on {{ $labels.instance }}"
+          description: >-
+            unifand_degraded has been 1 for 15 minutes: the GPU (NVML)
+            sensor is unavailable and the daemon is controlling fans from
+            CPU temperature alone. This is expected/permanent on CPU-only
+            nodes and on arm64 (no NVML, typically no k10temp — see README
+            Limitations); on a node that should have a working GPU sensor,
+            this indicates a driver/toolkit problem.
+
+      - alert: UnifandFallbackActive
+        expr: unifand_fallback_active == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "unifand has lost all sensors on {{ $labels.instance }}"
+          description: >-
+            unifand_fallback_active has been 1 for 5 minutes: every
+            temperature sensor is unavailable and the daemon is holding
+            fallback_duty as a safety measure. Fans are running at a fixed
+            duty with no thermal feedback loop. This is the single most
+            alertable failure condition the daemon exposes — investigate
+            immediately.
+
+      - alert: UnifandHidWriteErrors
+        expr: rate(unifand_hid_errors_total{kind="write"}[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "unifand duty writes are failing on {{ $labels.instance }}"
+          description: >-
+            unifand_hid_errors_total{kind="write"} has been increasing for
+            10 minutes. Duty-write failures are a control-safety concern
+            (fan speed may be stuck at whatever was last successfully
+            commanded), distinct from kind="read" (RPM read-back loss,
+            observability only). Sustained failures usually mean the hub
+            needs a re-enumeration cycle or a physical USB reseat.

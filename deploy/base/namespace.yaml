@@ -1,0 +1,11 @@
+---
+# unifand needs a privileged pod (hostPath /dev for hidraw access), so the
+# namespace opts into the privileged Pod Security Standard.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: unifand
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged

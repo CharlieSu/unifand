@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  # release-please dispatches this workflow at the release tag ref (see
+  # release-please.yaml) because GITHUB_TOKEN-created tags never fire the
+  # tags trigger above. The tag-gated jobs key on github.ref either way.
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/unifand
+  DEPLOY_ARTIFACT: ghcr.io/${{ github.repository_owner }}/unifand-deploy
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (master; no versioned releases, pinned by commit)
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (2.9.2)
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  audit:
+    # RustSec advisories + license/bans policy (deny.toml). No packages perms needed.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-audit,cargo-deny
+      - run: cargo audit
+      - run: cargo deny check
+
+  image:
+    # Multi-arch container image on version tags.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, audit]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern=v{{version}}
+            type=raw,value=latest
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: build
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-artifact:
+    # Kustomize manifests as a Flux-compatible OCI artifact on version tags.
+    # Waits on `image` too so the artifact can pin the workload image by the
+    # digest that job just pushed, not by a mutable tag.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: fluxcd/flux2/action@889be9d6cc8afa8ed639e1e1ba4ab678e3b38d8c # v2.9.4
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pin image version in the artifact
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          cd deploy/base
+          kustomize edit set image "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/unifand:${GITHUB_REF_NAME}@${DIGEST}"
+      - name: Push manifests
+        run: |
+          # OCI references must be lowercase; repository_owner may not be.
+          DEPLOY_ARTIFACT="${DEPLOY_ARTIFACT,,}"
+          flux push artifact "oci://${DEPLOY_ARTIFACT}:${GITHUB_REF_NAME}" \
+            --path=deploy \
+            --source="${{ github.repositoryUrl }}" \
+            --revision="${GITHUB_REF_NAME}/${GITHUB_SHA}"
+          flux tag artifact "oci://${DEPLOY_ARTIFACT}:${GITHUB_REF_NAME}" --tag latest

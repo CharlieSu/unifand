@@ -1,0 +1,40 @@
+# cargo-deny configuration. Run `cargo deny check` (advisories, licenses, bans, sources).
+# See https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# RustSec vulnerability advisories are always deny-by-default; there is
+# no toggle for that in current cargo-deny — a matching RUSTSEC advisory
+# fails `cargo deny check advisories` unless its ID is added to `ignore`
+# below. No advisories are ignored today; this is a placeholder for the
+# day one needs a documented, deliberate exception.
+ignore = []
+unmaintained = "workspace"
+yanked = "warn"
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+# nvml-wrapper's old proc-macro stack (wrapcenum-derive -> darling ->
+# syn 2.x) coexists with serde_derive's syn 3.x; both compile fine, this
+# is a build-time-only duplication tracked here as an explicit decision
+# (see Rust review I2/M12).
+skip = [
+    { crate = "syn@2.0.119", reason = "nvml-wrapper's wrapcenum-derive/darling stack predates syn 3; build-time only" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

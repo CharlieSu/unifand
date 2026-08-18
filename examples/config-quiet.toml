@@ -1,0 +1,52 @@
+# unifand configuration — "quiet office" curve
+#
+# Trades a few degrees for silence: fans stay at their floor until the
+# GPU is genuinely warm, ramp late, and never quite hit 100% below 85°C.
+# LEDs are dimmed and lazier to change. See examples/config.toml for
+# field-by-field documentation.
+
+poll_interval_secs = 5
+channels = [1, 2]
+fallback_duty = 50
+cpu_offset = 12.0
+hysteresis_c = 3.0
+min_duty_delta = 8
+max_step_per_tick = 5
+
+[[curve]]
+temp = 45.0
+duty = 25
+[[curve]]
+temp = 65.0
+duty = 35
+[[curve]]
+temp = 75.0
+duty = 55
+[[curve]]
+temp = 82.0
+duty = 80
+[[curve]]
+temp = 87.0
+duty = 100
+
+[rgb]
+enabled = true
+fans_per_channel = 6  # LED chain length; see examples/config.toml for why
+# [rgb.fans]          # optional per-channel override, e.g.:
+# 1 = 3
+# 2 = 6
+brightness = 3     # dimmed
+buckets = 5        # fewer, chunkier color steps
+
+[[rgb.stops]]
+duty = 25
+color = [0, 0, 128]
+[[rgb.stops]]
+duty = 55
+color = [0, 128, 0]
+[[rgb.stops]]
+duty = 100
+color = [200, 0, 0]
+
+[metrics]
+listen = "0.0.0.0:9877"

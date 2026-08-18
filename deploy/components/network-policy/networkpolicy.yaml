@@ -1,0 +1,44 @@
+---
+# Restricts who can reach the unifand metrics/health port (9877/tcp) to
+# namespaces carrying a monitoring label. Ingress-only: unifand's own
+# egress (dlopen'd libnvidia-ml, /sys and /dev reads, hidraw I/O) is all
+# local to the node and never leaves the pod network, so there is nothing
+# useful to restrict — and egress NetworkPolicies are a common source of
+# silent DNS breakage (CoreDNS lookups get dropped if not explicitly
+# allowed). Deliberately not declaring an egress policyType keeps egress
+# fully open and avoids that footgun.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: unifand
+  namespace: unifand
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: unifand
+  policyTypes:
+    - Ingress
+  ingress:
+    # NOTE: this ingress rule restricts :9877 — the same port the
+    # DaemonSet's own livenessProbe httpGets. Whether kubelet-originated
+    # health-check traffic bypasses NetworkPolicy is CNI-implementation-
+    # defined, not an API guarantee. Mainstream CNIs (Cilium, Calico,
+    # cloud-managed CNIs) exempt node-originated health checks from policy
+    # enforcement, so the probe keeps working unmodified in the common case
+    # — but verify on your own CNI before enabling this component. If
+    # liveness probes start failing (pod restarts) right after applying
+    # this policy, this is the first thing to check.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # PLACEHOLDER — this label does not exist in any real cluster.
+              # Replace it with a label your own monitoring/scraper namespace
+              # actually carries (e.g. kubernetes.io/metadata.name: monitoring,
+              # or a custom label you apply yourself). Left as an obvious
+              # placeholder on purpose so a copy-paste deploy fails closed
+              # (nothing matches) rather than silently allowing an
+              # unintended namespace.
+              monitoring.example.com/scrape: "true"
+      ports:
+        - protocol: TCP
+          port: 9877

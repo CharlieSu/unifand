@@ -1,0 +1,19 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: unifand
+  namespace: unifand
+spec:
+  template:
+    spec:
+      nodeSelector:
+        # REPLACE with the node your SL V2 hub is attached to.
+        kubernetes.io/hostname: my-node
+      # If your target node carries taints (GPU nodes often do), add
+      # matching tolerations here — otherwise the DaemonSet silently never
+      # schedules there. Example:
+      # tolerations:
+      #   - key: nvidia.com/gpu
+      #     operator: Exists
+      #     effect: NoSchedule

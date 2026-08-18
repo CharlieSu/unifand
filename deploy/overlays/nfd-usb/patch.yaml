@@ -1,0 +1,19 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: unifand
+  namespace: unifand
+spec:
+  template:
+    spec:
+      nodeSelector:
+        # REPLACE the serial segment with your hub's (see kustomization.yaml).
+        feature.node.kubernetes.io/usb-ff_0cf2_a105_0000000000.present: "true"
+      # If your target node carries taints (GPU nodes often do), add
+      # matching tolerations here — otherwise the DaemonSet silently never
+      # schedules there. Example:
+      # tolerations:
+      #   - key: nvidia.com/gpu
+      #     operator: Exists
+      #     effect: NoSchedule

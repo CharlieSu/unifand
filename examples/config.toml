@@ -1,0 +1,109 @@
+# unifand configuration — annotated default
+#
+# Temperatures are °C, duties are percent (0-100).
+# The control temperature each tick is max(gpu_temp, cpu_temp - cpu_offset);
+# if the GPU sensor is unavailable, raw CPU temp is used (and the
+# unifand_degraded metric reads 1).
+
+# Seconds between control-loop ticks.
+poll_interval_secs = 5
+
+# Hub fan channels to drive (1-4). Only list channels with fans attached.
+channels = [1, 2]
+
+# Duty applied on shutdown (SIGTERM) and when every sensor fails.
+# Pick something you could live with indefinitely under load.
+fallback_duty = 60
+
+# Subtracted from CPU temp before comparing against GPU temp, so a
+# CPU-only spike doesn't over-drive fans tuned to GPU thresholds.
+cpu_offset = 10.0
+
+# Duty only changes when the control temp moved at least this far...
+hysteresis_c = 2.0
+# ...or the target duty differs from the current duty by at least this much.
+min_duty_delta = 5
+# Duty moves at most this many points per tick (ramp smoothing).
+max_step_per_tick = 10
+
+# The fan curve: piecewise-linear, clamped at both ends.
+# Temps must be strictly increasing.
+[[curve]]
+temp = 35.0
+duty = 30
+[[curve]]
+temp = 55.0
+duty = 40
+[[curve]]
+temp = 68.0
+duty = 65
+[[curve]]
+temp = 75.0
+duty = 85
+[[curve]]
+temp = 80.0
+duty = 100
+
+# Optional: fan LEDs display a color mapped to the current duty.
+[rgb]
+enabled = true
+# This declares the LED chain length to the hub (start-packet byte 3);
+# it is NOT just cosmetic — a value shorter than the physically-connected
+# chain leaves the tail fans dark (e.g. 4 on a 6-fan chain lights only
+# fans 1-4). 6 is the hub's max chain length and safe to leave as-is even
+# on shorter chains. Only lower it, or use [rgb.fans] below, if you have a
+# specific reason to.
+fans_per_channel = 6
+# Optional per-channel override when channels have different physical
+# chain lengths (e.g. a 3-fan chain on channel 1, 6-fan on channel 2).
+# Keys are channel numbers (as strings, since TOML table keys are
+# strings), values are 1..=6. Any channel not listed here falls back to
+# fans_per_channel above.
+# [rgb.fans]
+# 1 = 3
+# 2 = 6
+# 0 = 100% brightness ... 8 = off (hub's own scale).
+brightness = 0
+# Duty range is quantized into this many bins; colors are only written
+# when the bin changes (keeps LED traffic minimal).
+buckets = 8
+
+# Color gradient over duty. Colors are [r, g, b].
+[[rgb.stops]]
+duty = 30
+color = [0, 0, 255]     # blue — idle
+[[rgb.stops]]
+duty = 50
+color = [0, 255, 0]     # green
+[[rgb.stops]]
+duty = 75
+color = [255, 255, 0]   # yellow
+[[rgb.stops]]
+duty = 90
+color = [255, 128, 0]   # orange
+[[rgb.stops]]
+duty = 100
+color = [255, 0, 0]     # red — full tilt
+
+[metrics]
+# Prometheus text endpoint.
+listen = "0.0.0.0:9877"
+
+# Alarm ladder: LEDs escalate from the static gradient to animated alerts.
+# States: sustained-hot (slow breathing in the gradient color), near-limit
+# (red breathing that speeds up the longer you sit there), fault (orange/red
+# runway when all sensors are lost). See README "The alarm ladder".
+[rgb.alerts]
+enabled = true
+# Sustained-hot: control temp at/above this...
+sustained_hot_c = 75.0
+# ...continuously for this long.
+sustained_after_secs = 120
+# Near-limit: within this many degrees of the curve's top temp, or duty at 100%.
+near_limit_margin_c = 3.0
+# Red pulse speeds up one hub step per interval while near-limit persists.
+escalate_every_secs = 30
+# A state must be clear this long before the ladder steps back down.
+cooldown_secs = 60
+alert_color = [255, 0, 0]
+fault_colors = [[255, 80, 0], [255, 0, 0]]

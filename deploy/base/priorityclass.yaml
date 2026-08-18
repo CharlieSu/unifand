@@ -1,0 +1,35 @@
+---
+# unifand-critical: outranks ordinary workload pods.
+#
+# unifand is a node thermal-safety daemon, not an application — its stated
+# invariant is "daemon-down must never mean fans-at-idle under load". A
+# DaemonSet with default (best-effort-ish) scheduling priority is exactly as
+# evictable as any other pod under node resource pressure, which directly
+# undercuts that invariant: losing fan control is a hardware-safety event,
+# not a capacity-management tradeoff. This value sits above the built-in
+# workload range but below system-cluster-critical/system-node-critical
+# (reserved for control-plane components), so kubelet preempts ordinary pods
+# rather than unifand when a node is under pressure.
+#
+# PriorityClass is cluster-scoped (not namespaced) — kustomize's namespace
+# transformer, if one is layered on by a consumer, leaves this object alone.
+#
+# preemptionPolicy is intentionally left unset here, so it defaults to
+# PreemptLowerPriority: a pending unifand pod may preempt (evict) lower-
+# priority pods to get scheduled. That's the right default for a thermal-
+# safety daemon — the alternative, Never, would let unifand sit unscheduled
+# under pressure instead, which is exactly the outcome this PriorityClass
+# exists to prevent. The API server fills the field in at admission, so it
+# won't appear in `kubectl kustomize` output — only on the live object
+# (`kubectl get priorityclass unifand-critical -o yaml`).
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: unifand-critical
+value: 100010000
+globalDefault: false
+description: >-
+  Node thermal-safety daemon (unifand). Must not be evicted ahead of ordinary
+  workloads under node pressure — losing fan control risks thermal damage to
+  the hardware it protects, including the GPU/CPU workloads it's competing
+  with for scheduling priority.
