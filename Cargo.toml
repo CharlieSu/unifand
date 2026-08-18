@@ -12,7 +12,7 @@ serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 toml = "0.8"
 libc = "0.2"
-nvml-wrapper = "0.10"
+nvml-wrapper = "0.12"
 tiny_http = "0.12"
 signal-hook = "0.3"
 log = "0.4"
