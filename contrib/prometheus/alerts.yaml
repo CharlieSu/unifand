@@ -123,3 +123,25 @@ groups:
             commanded), distinct from kind="read" (RPM read-back loss,
             observability only). Sustained failures usually mean the hub
             needs a re-enumeration cycle or a physical USB reseat.
+
+      # Fan-stall detection: RPM read-back exists precisely so a dead or
+      # wedged fan is observable — this rule closes the loop. Both metrics
+      # carry the same label set (channel + scrape labels), so the bare
+      # `and` matches one-to-one per channel: alert when a channel is being
+      # commanded meaningful duty but its fans report (near-)zero RPM.
+      # Note: a channel with no fans connected reads 0 rpm permanently —
+      # only list populated channels in `channels = [...]`, or silence the
+      # alert for known-empty channels.
+      - alert: UnifandFanStalled
+        expr: unifand_fan_rpm < 100 and unifand_duty_percent > 30
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "fan channel {{ $labels.channel }} appears stalled"
+          description: >-
+            Channel {{ $labels.channel }} has been commanded above 30% duty
+            but reports under 100 rpm for 2 minutes. The fan may be stalled,
+            unplugged, or the hub may be ignoring commands while still
+            answering RPM reads. Check airflow immediately — the daemon
+            believes it is cooling.
