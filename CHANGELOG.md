@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/) —
 with the pre-1.0 caveat that minor version bumps may carry breaking changes
 (protocol/metric shape changes), called out explicitly below.
 
+## [0.5.0](https://github.com/CharlieSu/unifand/compare/v0.4.0...v0.5.0) (2026-08-18)
+
+
+### Features
+
+* **contrib:** fan-stall alert rule ([6dc0518](https://github.com/CharlieSu/unifand/commit/6dc051873375ba13e16b1b0b6439c86036b9b494))
+
 ## [0.4.0] - 2026-08-18
 
 A hardening release: closes the observability/liveness gap found by an
