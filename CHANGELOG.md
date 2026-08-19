@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/) —
 with the pre-1.0 caveat that minor version bumps may carry breaking changes
 (protocol/metric shape changes), called out explicitly below.
 
+## [0.6.0](https://github.com/CharlieSu/unifand/compare/v0.5.1...v0.6.0) (2026-08-19)
+
+
+### Features
+
+* **signals:** multi-signal fusion — GPU power, thermal margin, throttle floor ([#14](https://github.com/CharlieSu/unifand/issues/14)) ([78f34af](https://github.com/CharlieSu/unifand/commit/78f34af955311e5fc2bcdc24b9945f20d2bea35c))
+
 ## [0.5.1](https://github.com/CharlieSu/unifand/compare/v0.5.0...v0.5.1) (2026-08-19)
 
 
@@ -199,4 +206,3 @@ Initial release: the core fan-control daemon.
   fallback duty before exit.
 - TOML config with defaults and validation.
 - Multi-stage container build.
-
