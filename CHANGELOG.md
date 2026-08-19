@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/) —
 with the pre-1.0 caveat that minor version bumps may carry breaking changes
 (protocol/metric shape changes), called out explicitly below.
 
+## [0.5.1](https://github.com/CharlieSu/unifand/compare/v0.5.0...v0.5.1) (2026-08-19)
+
+
+### Bug Fixes
+
+* **build:** cross-compile target arches instead of QEMU emulation ([9c15695](https://github.com/CharlieSu/unifand/commit/9c15695d8fb7b2b8d4dcc0eb43875012a272606d))
+* **deps:** update rust crate nvml-wrapper to 0.12 ([#2](https://github.com/CharlieSu/unifand/issues/2)) ([929a1df](https://github.com/CharlieSu/unifand/commit/929a1df230ddb9f85ddcc2c76251f2669f9b44f5))
+* **deps:** update rust crate signal-hook to 0.4 ([#3](https://github.com/CharlieSu/unifand/issues/3)) ([800dced](https://github.com/CharlieSu/unifand/commit/800dced9a6e8c1d7266c81ce02f752bb88a2a747))
+* **deps:** update rust crate toml to v1 ([#11](https://github.com/CharlieSu/unifand/issues/11)) ([91a7398](https://github.com/CharlieSu/unifand/commit/91a73985557056991796c1a68363dbc612fb074d))
+
 ## [0.5.0](https://github.com/CharlieSu/unifand/compare/v0.4.0...v0.5.0) (2026-08-18)
 
 
