@@ -1144,6 +1144,26 @@ duty = 100
         let c = Config::from_str(s).unwrap();
         assert_eq!(c.signals.gpu_power.curve[0].temp, 120.0);
         assert_eq!(c.signals.gpu_power.curve[1].temp, 560.0);
+
+        // `value` must be a serde ALIAS, not a rename: an alias is a known key,
+        // so it must not surface as an unknown-key warning. If this ever
+        // regressed to `rename`, `temp` would break elsewhere and `value` would
+        // start warning -- neither of which the assertions above would catch,
+        // since from_str only logs unknown keys rather than failing.
+        let (_, ignored) = Config::parse_with_ignored(s).unwrap();
+        assert!(
+            ignored.is_empty(),
+            "`value` alias must not be reported as an unknown key, got {ignored:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_mem_temp_enabled_without_curve() {
+        // Same contract as power/margin: no top-level fallback exists for a
+        // memory-temperature curve, so enabling the signal without one is a
+        // config error rather than a silently inert signal.
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.mem_temp]\nenabled = true\n";
+        assert!(Config::from_str(s).is_err());
     }
 
     #[test]
