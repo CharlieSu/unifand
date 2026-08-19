@@ -1,3 +1,4 @@
+use crate::signals::{SignalKind, ThrottleFlags};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +16,18 @@ struct State {
     rgb_errors: u64,
     led_state: u8,
     last_tick: u64,
+
+    // Multi-signal fusion (Wave 5). Keyed by SignalKind::as_str(); a key is
+    // only ever present once the corresponding setter has been called for
+    // that signal this run, so an unavailable signal emits no series at all
+    // (matching how `temps` already behaves when a sensor is missing).
+    signal_values: BTreeMap<&'static str, (f64, &'static str)>,
+    signal_candidate_duty: BTreeMap<&'static str, u8>,
+    control_signal: Option<&'static str>,
+    gpu_power_limit_w: Option<f64>,
+    throttle: Option<ThrottleFlags>,
+    throttle_floor_active: bool,
+    signal_errors: BTreeMap<&'static str, u64>,
 }
 
 pub struct Metrics {
@@ -101,6 +114,58 @@ impl Metrics {
         self.state().last_tick = unix_secs;
     }
 
+    /// Conditioned (smoothed) value of one available input signal.
+    #[allow(dead_code)] // wired by Wave 7's control-loop integration
+    pub fn set_signal_value(&self, signal: SignalKind, v: f64) {
+        self.state()
+            .signal_values
+            .insert(signal.as_str(), (v, signal.unit()));
+    }
+    /// Duty this signal's own curve would command this tick, independent of
+    /// whether it ends up winning the max-of-candidates fusion.
+    #[allow(dead_code)] // wired by Wave 7's control-loop integration
+    pub fn set_candidate_duty(&self, signal: SignalKind, duty: u8) {
+        self.state()
+            .signal_candidate_duty
+            .insert(signal.as_str(), duty);
+    }
+    /// The signal whose candidate duty drove the applied duty this tick.
+    /// Rendered one-hot against every currently-available signal (i.e. every
+    /// signal with a candidate duty registered) rather than as a single
+    /// info-series whose label value changes, which would leave stale
+    /// timeseries behind and break rate()/graphing across a hand-off.
+    #[allow(dead_code)] // wired by Wave 7's control-loop integration
+    pub fn set_control_signal(&self, winner: SignalKind) {
+        self.state().control_signal = Some(winner.as_str());
+    }
+    /// Enforced GPU power limit, when known. Enables percent-of-limit
+    /// dashboards regardless of which unit the power curve itself uses.
+    #[allow(dead_code)] // wired by Wave 7's control-loop integration
+    pub fn set_gpu_power_limit_watts(&self, v: f64) {
+        self.state().gpu_power_limit_w = Some(v);
+    }
+    /// Snapshot of NVML throttle-reason bits for this tick.
+    #[allow(dead_code)] // wired by Wave 7's control-loop integration
+    pub fn set_throttle(&self, flags: ThrottleFlags) {
+        self.state().throttle = Some(flags);
+    }
+    /// 1 while the throttle floor is raising the applied duty above what the
+    /// fused signals alone would command (including its hold window).
+    #[allow(dead_code)] // wired by Wave 7's control-loop integration
+    pub fn set_throttle_floor_active(&self, v: bool) {
+        self.state().throttle_floor_active = v;
+    }
+    /// A REAL read failure for this signal (not `NotSupported`, which means
+    /// the signal is simply absent from this card/driver).
+    #[allow(dead_code)] // wired by Wave 7's control-loop integration
+    pub fn inc_signal_error(&self, signal: SignalKind) {
+        *self
+            .state()
+            .signal_errors
+            .entry(signal.as_str())
+            .or_insert(0) += 1;
+    }
+
     fn healthz(&self) -> bool {
         let last_tick = self.state().last_tick;
         healthz_ok(now_unix_secs(), last_tick, self.poll_interval_secs)
@@ -157,6 +222,74 @@ impl Metrics {
         out.push_str(&format!("unifand_rgb_errors_total {}\n", s.rgb_errors));
         out.push_str("# HELP unifand_led_state Alarm ladder state (0 normal, 1 sustained-hot, 2 near-limit, 3 fault).\n# TYPE unifand_led_state gauge\n");
         out.push_str(&format!("unifand_led_state {}\n", s.led_state));
+
+        // --- Multi-signal fusion (Wave 5, strictly additive) ---
+        // Absent signal => no series, matching `temps` above: these maps are
+        // only ever populated for signals that are actually available.
+        if !s.signal_values.is_empty() {
+            out.push_str("# HELP unifand_signal_value Conditioned (smoothed) value of each available input signal.\n# TYPE unifand_signal_value gauge\n");
+            for (signal, (v, unit)) in &s.signal_values {
+                out.push_str(&format!(
+                    "unifand_signal_value{{signal=\"{}\",unit=\"{}\"}} {}\n",
+                    signal, unit, v
+                ));
+            }
+        }
+        if !s.signal_candidate_duty.is_empty() {
+            out.push_str("# HELP unifand_signal_candidate_duty_percent Duty each available signal's curve commands this tick.\n# TYPE unifand_signal_candidate_duty_percent gauge\n");
+            for (signal, duty) in &s.signal_candidate_duty {
+                out.push_str(&format!(
+                    "unifand_signal_candidate_duty_percent{{signal=\"{}\"}} {}\n",
+                    signal, duty
+                ));
+            }
+            out.push_str("# HELP unifand_control_signal One-hot: 1 for the signal driving the applied duty, 0 for other available signals.\n# TYPE unifand_control_signal gauge\n");
+            for signal in s.signal_candidate_duty.keys() {
+                let v = if s.control_signal == Some(*signal) {
+                    1
+                } else {
+                    0
+                };
+                out.push_str(&format!(
+                    "unifand_control_signal{{signal=\"{}\"}} {}\n",
+                    signal, v
+                ));
+            }
+        }
+        if let Some(limit) = s.gpu_power_limit_w {
+            out.push_str("# HELP unifand_gpu_power_limit_watts Enforced GPU power limit; enables percent-of-limit dashboards regardless of curve unit.\n# TYPE unifand_gpu_power_limit_watts gauge\n");
+            out.push_str(&format!("unifand_gpu_power_limit_watts {}\n", limit));
+        }
+        if let Some(t) = &s.throttle {
+            out.push_str("# HELP unifand_throttle_active NVML throttle reason currently asserted.\n# TYPE unifand_throttle_active gauge\n");
+            for (reason, active) in [
+                ("sw_thermal", t.sw_thermal),
+                ("hw_thermal", t.hw_thermal),
+                ("hw_power_brake", t.hw_power_brake),
+                ("sw_power_cap", t.sw_power_cap),
+            ] {
+                out.push_str(&format!(
+                    "unifand_throttle_active{{reason=\"{}\"}} {}\n",
+                    reason,
+                    if active { 1 } else { 0 }
+                ));
+            }
+        }
+        out.push_str("# HELP unifand_throttle_floor_active 1 while the throttle floor is raising applied duty (including hold window).\n# TYPE unifand_throttle_floor_active gauge\n");
+        out.push_str(&format!(
+            "unifand_throttle_floor_active {}\n",
+            if s.throttle_floor_active { 1 } else { 0 }
+        ));
+        if !s.signal_errors.is_empty() {
+            out.push_str("# HELP unifand_signal_errors_total Real read failures per signal; NotSupported is not counted (it means the signal is absent).\n# TYPE unifand_signal_errors_total counter\n");
+            for (signal, count) in &s.signal_errors {
+                out.push_str(&format!(
+                    "unifand_signal_errors_total{{signal=\"{}\"}} {}\n",
+                    signal, count
+                ));
+            }
+        }
+
         out.push_str("# HELP unifand_last_tick_timestamp_seconds Unix time the control loop last completed a tick (or startup hub-wait progress).\n# TYPE unifand_last_tick_timestamp_seconds gauge\n");
         out.push_str(&format!(
             "unifand_last_tick_timestamp_seconds {}\n",
@@ -336,5 +469,81 @@ mod tests {
     fn healthz_ok_zero_poll_interval_requires_exact_match() {
         assert!(healthz_ok(100, 100, 0));
         assert!(!healthz_ok(101, 100, 0));
+    }
+
+    #[test]
+    fn signal_value_renders_with_unit_label() {
+        let m = m();
+        m.set_signal_value(SignalKind::GpuPower, 412.5);
+        let out = m.render();
+        assert!(out.contains("# HELP unifand_signal_value"));
+        assert!(out.contains("# TYPE unifand_signal_value gauge"));
+        assert!(out.contains("unifand_signal_value{signal=\"gpu_power\",unit=\"watts\"} 412.5"));
+    }
+
+    #[test]
+    fn candidate_duty_renders_per_signal() {
+        let m = m();
+        m.set_candidate_duty(SignalKind::GpuTemp, 55);
+        m.set_candidate_duty(SignalKind::GpuPower, 80);
+        let out = m.render();
+        assert!(out.contains("# TYPE unifand_signal_candidate_duty_percent gauge"));
+        assert!(out.contains("unifand_signal_candidate_duty_percent{signal=\"gpu_temp\"} 55"));
+        assert!(out.contains("unifand_signal_candidate_duty_percent{signal=\"gpu_power\"} 80"));
+    }
+
+    #[test]
+    fn control_signal_is_one_hot() {
+        let m = m();
+        // Two available signals (both have a candidate duty); a third
+        // (mem_temp) is never registered, i.e. unavailable this run.
+        m.set_candidate_duty(SignalKind::GpuPower, 80);
+        m.set_candidate_duty(SignalKind::GpuTemp, 55);
+        m.set_control_signal(SignalKind::GpuPower);
+        let out = m.render();
+        assert!(out.contains("# TYPE unifand_control_signal gauge"));
+        assert!(out.contains("unifand_control_signal{signal=\"gpu_power\"} 1"));
+        assert!(out.contains("unifand_control_signal{signal=\"gpu_temp\"} 0"));
+        assert!(!out.contains("signal=\"mem_temp\""));
+    }
+
+    #[test]
+    fn absent_signal_emits_no_series() {
+        let m = m();
+        m.set_signal_value(SignalKind::GpuPower, 100.0);
+        m.set_candidate_duty(SignalKind::GpuPower, 60);
+        m.set_control_signal(SignalKind::GpuPower);
+        let out = m.render();
+        // mem_temp is never touched -> absent, not zero.
+        assert!(!out.contains("signal=\"mem_temp\""));
+    }
+
+    #[test]
+    fn throttle_metrics_render_all_four_reasons() {
+        let m = m();
+        m.set_throttle(ThrottleFlags {
+            sw_thermal: true,
+            hw_thermal: false,
+            hw_power_brake: false,
+            sw_power_cap: true,
+        });
+        let out = m.render();
+        assert!(out.contains("# TYPE unifand_throttle_active gauge"));
+        assert!(out.contains("unifand_throttle_active{reason=\"sw_thermal\"} 1"));
+        assert!(out.contains("unifand_throttle_active{reason=\"hw_thermal\"} 0"));
+        assert!(out.contains("unifand_throttle_active{reason=\"hw_power_brake\"} 0"));
+        assert!(out.contains("unifand_throttle_active{reason=\"sw_power_cap\"} 1"));
+    }
+
+    #[test]
+    fn legacy_render_is_unchanged_when_no_signals_registered() {
+        let m = m();
+        m.set_temp("gpu", 71.0);
+        m.set_duty(1, 65);
+        m.set_rpm(1, 1350);
+        m.set_degraded(false);
+        m.set_led_state(0);
+        let out = m.render();
+        assert!(!out.contains("unifand_signal_"));
     }
 }
