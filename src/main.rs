@@ -11,7 +11,9 @@ use anyhow::Result;
 use config::{Config, RgbConfig};
 use curve::Controller;
 use metrics::now_unix_secs;
-use sensors::{control_temp, should_reprobe, CpuSensor, GpuSensor, REDISCOVERY_INTERVAL_TICKS};
+use sensors::{
+    control_temp, format_probe, should_reprobe, CpuSensor, GpuSensor, REDISCOVERY_INTERVAL_TICKS,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,6 +22,7 @@ use std::time::{Duration, Instant};
 struct Args {
     config: PathBuf,
     oneshot: bool,
+    probe_gpu: bool,
 }
 
 struct TempReadings {
@@ -36,6 +39,7 @@ fn parse_args() -> Args {
     let mut args = Args {
         config: PathBuf::from("/etc/unifand/config.toml"),
         oneshot: false,
+        probe_gpu: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -44,8 +48,11 @@ fn parse_args() -> Args {
                 args.config = PathBuf::from(it.next().expect("--config requires a path"));
             }
             "--oneshot" => args.oneshot = true,
+            "--probe-gpu" => args.probe_gpu = true,
             other => {
-                eprintln!("unknown argument: {other}\nusage: unifand [--config PATH] [--oneshot]");
+                eprintln!(
+                    "unknown argument: {other}\nusage: unifand [--config PATH] [--oneshot] [--probe-gpu]"
+                );
                 std::process::exit(2);
             }
         }
@@ -221,6 +228,19 @@ fn main() -> Result<()> {
         cpu.is_some(),
         gpu.is_some()
     );
+
+    if args.probe_gpu {
+        return match &gpu {
+            Some(g) => {
+                print!("{}", format_probe(&g.probe_snapshot()));
+                Ok(())
+            }
+            None => {
+                println!("gpu sensor absent: no NVML device found");
+                Ok(())
+            }
+        };
+    }
 
     if args.oneshot {
         let temps = read_temps(&cpu, &gpu);
