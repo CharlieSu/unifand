@@ -228,7 +228,9 @@ impl Config {
     /// these. Split out from `from_str` so the collection can be tested
     /// without capturing log output.
     fn parse_with_ignored(s: &str) -> Result<(Config, Vec<String>)> {
-        let de = toml::Deserializer::new(s);
+        // toml v1: Deserializer::parse replaces ::new and returns a Result
+        // (syntax errors surface here instead of during deserialization).
+        let de = toml::Deserializer::parse(s).context("parsing config TOML")?;
         let mut ignored = Vec::new();
         let cfg: Config = serde_ignored::deserialize(de, |path| {
             ignored.push(path.to_string());
