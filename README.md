@@ -328,6 +328,20 @@ plain annotation-based discovery. See [`contrib/README.md`](contrib/README.md).
 
 ## Troubleshooting
 
+**`ERROR: init 250 result=11` glued to the first log line (Talos Linux).**
+Not from unifand — that line prints before the daemon's first instruction
+executes. It's the NVIDIA container toolkit's driver-init probe failing an
+`ld.so.cache` lookup during container setup: on Talos the glibc ldcache is
+read-only and doesn't include the staged NVIDIA libraries, so the probe
+errors (and its stderr shares the container's log pipe), then everything
+resolves via direct loader paths anyway. Harmless as long as the next lines
+show `gpu(nvml)=true` — which they will. Tracked upstream in
+[siderolabs/extensions#940](https://github.com/siderolabs/extensions/issues/940);
+it disappears once your Talos schematic carries the fixed extension. (The
+severe form of the same bug segfaults GPU containers on older
+`nvidia-container-toolkit-lts` versions — if unifand *crashes* at startup on
+Talos rather than just logging this line, read that issue.)
+
 **DaemonSet shows `0/0` pods, no errors, no events.** The `nodeSelector`
 doesn't match any node — almost always the `overlays/nodename` overlay
 applied with its placeholder `my-node` hostname unedited (see Scheduling
