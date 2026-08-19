@@ -122,7 +122,9 @@ spec:
   interval: 1h
   url: oci://ghcr.io/charliesu/unifand-deploy
   ref:
-    semver: ">=0.2.0"
+    # Track releases from the current one forward (any floor works — a
+    # semver range always resolves to the newest matching release).
+    semver: ">=0.5.1" # x-release-please-version
 ---
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
