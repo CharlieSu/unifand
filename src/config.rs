@@ -288,17 +288,10 @@ impl Default for ThrottleConfig {
 /// `[signals]` section: multi-signal fan-curve fusion (GPU power, thermal
 /// margin, throttle floor), gated behind `enabled` — inert unless turned on,
 /// mirroring `[rgb]`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct SignalsConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Applied uniformly to all 5 signal filters in `SignalConditioner`.
-    /// Defaults (rise 0.5 / fall 0.1 at a 5 s tick) give τ_rise ≈ 7 s,
-    /// τ_fall ≈ 47 s.
-    #[serde(default = "d_signals_rise_alpha")]
-    pub rise_alpha: f64,
-    #[serde(default = "d_signals_fall_alpha")]
-    pub fall_alpha: f64,
     #[serde(default)]
     pub gpu_temp: GpuTempConfig,
     #[serde(default)]
@@ -311,22 +304,6 @@ pub struct SignalsConfig {
     pub mem_temp: MemTempConfig,
     #[serde(default)]
     pub throttle: ThrottleConfig,
-}
-
-impl Default for SignalsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            rise_alpha: d_signals_rise_alpha(),
-            fall_alpha: d_signals_fall_alpha(),
-            gpu_temp: GpuTempConfig::default(),
-            cpu_temp: CpuTempConfig::default(),
-            gpu_power: GpuPowerConfig::default(),
-            thermal_margin: MarginConfig::default(),
-            mem_temp: MemTempConfig::default(),
-            throttle: ThrottleConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -432,12 +409,6 @@ fn d_power_rise_alpha() -> f64 {
     0.5
 }
 fn d_power_fall_alpha() -> f64 {
-    0.1
-}
-fn d_signals_rise_alpha() -> f64 {
-    0.5
-}
-fn d_signals_fall_alpha() -> f64 {
     0.1
 }
 fn d_throttle_floor_duty() -> u8 {
@@ -1048,8 +1019,6 @@ fans_per_channel = 6
     fn signals_defaults_off_and_sane() {
         let c = Config::from_str("[[curve]]\ntemp = 40.0\nduty = 50\n").unwrap();
         assert!(!c.signals.enabled);
-        assert_eq!(c.signals.rise_alpha, 0.5);
-        assert_eq!(c.signals.fall_alpha, 0.1);
 
         assert!(c.signals.gpu_temp.enabled);
         assert!(c.signals.gpu_temp.curve.is_empty());

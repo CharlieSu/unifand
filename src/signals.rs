@@ -212,11 +212,26 @@ pub struct SignalConditioner {
 }
 
 impl SignalConditioner {
+    /// Builds one filter per signal from that signal's own config: a
+    /// symmetric `alpha` for the four temperature/margin signals, and the
+    /// asymmetric `rise_alpha`/`fall_alpha` pair for GPU power (the one
+    /// signal that needs to rise fast and fall slow — see `AsymEwma`'s
+    /// doc comment). Indexed via `kind.idx()` per assignment so the filter
+    /// array's order can never drift from `SignalKind`'s declaration order.
     pub fn new(cfg: &SignalsConfig) -> Self {
-        let filter = AsymEwma::new(cfg.rise_alpha, cfg.fall_alpha);
-        Self {
-            filters: [filter; 5],
+        let mut filters = [AsymEwma::symmetric(1.0); 5];
+        for &kind in SignalKind::ALL.iter() {
+            filters[kind.idx()] = match kind {
+                SignalKind::MemTemp => AsymEwma::symmetric(cfg.mem_temp.alpha),
+                SignalKind::ThermalMargin => AsymEwma::symmetric(cfg.thermal_margin.alpha),
+                SignalKind::GpuTemp => AsymEwma::symmetric(cfg.gpu_temp.alpha),
+                SignalKind::GpuPower => {
+                    AsymEwma::new(cfg.gpu_power.rise_alpha, cfg.gpu_power.fall_alpha)
+                }
+                SignalKind::CpuTemp => AsymEwma::symmetric(cfg.cpu_temp.alpha),
+            };
         }
+        Self { filters }
     }
 
     /// Applies `plausible()` THEN the filter. An implausible sample is
@@ -546,7 +561,8 @@ mod tests {
 
     #[test]
     fn conditioner_drops_implausible_sample_without_poisoning_filter() {
-        let cfg = SignalsConfig::default(); // rise 0.5 / fall 0.1
+        let mut cfg = SignalsConfig::default();
+        cfg.mem_temp.alpha = 0.5; // exercise blending explicitly rather than the default passthrough (alpha 1.0)
         let mut cond = SignalConditioner::new(&cfg);
 
         // Prime with a plausible reading; first sample seeds the filter directly.
@@ -586,7 +602,8 @@ mod tests {
 
     #[test]
     fn conditioner_reset_gpu_preserves_cpu_filter() {
-        let cfg = SignalsConfig::default(); // rise 0.5 / fall 0.1
+        let mut cfg = SignalsConfig::default();
+        cfg.cpu_temp.alpha = 0.5; // exercise blending explicitly rather than the default passthrough (alpha 1.0)
         let mut cond = SignalConditioner::new(&cfg);
 
         // Prime all five filters (first sample seeds each directly).
@@ -625,6 +642,79 @@ mod tests {
             after_reset.values[SignalKind::CpuTemp.idx()],
             Some(72.5),
             "CpuTemp filter must survive reset_gpu() and keep blending from held state"
+        );
+    }
+
+    #[test]
+    fn conditioner_uses_per_signal_alphas() {
+        let mut cfg = SignalsConfig::default();
+        cfg.gpu_temp.alpha = 1.0; // passthrough: tracks the raw sample exactly
+        cfg.thermal_margin.alpha = 0.5; // symmetric blend, halfway either direction
+        cfg.gpu_power.rise_alpha = 0.5;
+        cfg.gpu_power.fall_alpha = 0.1; // rises fast, falls slow
+        let mut cond = SignalConditioner::new(&cfg);
+
+        // Prime all three filters at the same starting value.
+        let primed = cond.update(&SignalReadings {
+            gpu_temp_c: Some(40.0),
+            thermal_margin_c: Some(40.0),
+            gpu_power_w: Some(40.0),
+            ..Default::default()
+        });
+        assert_eq!(primed.values[SignalKind::GpuTemp.idx()], Some(40.0));
+        assert_eq!(primed.values[SignalKind::ThermalMargin.idx()], Some(40.0));
+        assert_eq!(primed.values[SignalKind::GpuPower.idx()], Some(40.0));
+
+        // Rising edge, same-sized step (40 -> 80) fed to all three:
+        // gpu_temp (alpha 1.0) jumps straight to the raw sample; margin
+        // (alpha 0.5, symmetric) lands exactly halfway; power's rise_alpha
+        // is also 0.5, so it lands at the same halfway point on the rise.
+        let risen = cond.update(&SignalReadings {
+            gpu_temp_c: Some(80.0),
+            thermal_margin_c: Some(80.0),
+            gpu_power_w: Some(80.0),
+            ..Default::default()
+        });
+        assert_eq!(
+            risen.values[SignalKind::GpuTemp.idx()],
+            Some(80.0),
+            "gpu_temp alpha=1.0 must track the raw sample exactly"
+        );
+        assert_eq!(
+            risen.values[SignalKind::ThermalMargin.idx()],
+            Some(60.0),
+            "margin alpha=0.5 must land halfway between old and new"
+        );
+        assert_eq!(
+            risen.values[SignalKind::GpuPower.idx()],
+            Some(60.0),
+            "power rise_alpha=0.5 must land halfway on the rising edge"
+        );
+
+        // Falling edge, same-sized step (80 -> 20) fed to all three:
+        // gpu_temp again tracks exactly (alpha 1.0, symmetric); margin again
+        // lands halfway (alpha 0.5, symmetric: 0.5*20 + 0.5*60 = 40); power's
+        // fall_alpha=0.1 must move far less (0.1*20 + 0.9*60 = 56) than
+        // margin's symmetric 0.5 on an identical step — proving power's
+        // rise/fall smoothing is genuinely asymmetric, not just reusing one
+        // shared config knob.
+        let fallen = cond.update(&SignalReadings {
+            gpu_temp_c: Some(20.0),
+            thermal_margin_c: Some(20.0),
+            gpu_power_w: Some(20.0),
+            ..Default::default()
+        });
+        assert_eq!(fallen.values[SignalKind::GpuTemp.idx()], Some(20.0));
+        assert_eq!(fallen.values[SignalKind::ThermalMargin.idx()], Some(40.0));
+        assert_eq!(fallen.values[SignalKind::GpuPower.idx()], Some(56.0));
+
+        let margin_fall = risen.values[SignalKind::ThermalMargin.idx()].unwrap()
+            - fallen.values[SignalKind::ThermalMargin.idx()].unwrap();
+        let power_fall = risen.values[SignalKind::GpuPower.idx()].unwrap()
+            - fallen.values[SignalKind::GpuPower.idx()].unwrap();
+        assert!(
+            power_fall < margin_fall,
+            "power (fall_alpha=0.1) must fall less than margin (alpha=0.5) on an identical step: power_fall={power_fall} margin_fall={margin_fall}"
         );
     }
 
