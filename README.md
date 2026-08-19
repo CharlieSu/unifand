@@ -103,7 +103,7 @@ The base image tag is `ghcr.io/charliesu/unifand:latest` with
 `imagePullPolicy: IfNotPresent` — after the first pull on a node, that
 behaves like a pin (no silent upgrades on pod restart), but it's *not* a
 reproducible one across nodes or over time. For a real pin, either
-`kustomize edit set image ghcr.io/charliesu/unifand:v0.5.0` in your overlay, <!-- x-release-please-version -->
+`kustomize edit set image ghcr.io/charliesu/unifand:v0.5.1` in your overlay, <!-- x-release-please-version -->
 or consume the release's digest-pinned OCI artifact via the Flux path below
 (pre-pinned by CI on every tag).
 
@@ -180,7 +180,7 @@ spec:
             # ...your full config.toml contents...
   images:
     - name: ghcr.io/charliesu/unifand
-      newTag: v0.5.0 # x-release-please-version
+      newTag: v0.5.1 # x-release-please-version
   prune: true
 ```
 
