@@ -124,7 +124,7 @@ pub enum ThrottleReason {
     SwPowerCap,
 }
 
-/// Unit the configured `[signals.power]` curve's X axis is expressed in.
+/// Unit the configured `[signals.gpu_power]` curve's X axis is expressed in.
 /// Default is `watts` — a portable `percent_tdp` default risks silently
 /// reinterpreting a lab-tuned watts curve, so the explicit default favors
 /// the less surprising failure mode (see `validate`'s `percent_tdp` guard).
@@ -185,7 +185,7 @@ impl Default for CpuTempConfig {
     }
 }
 
-/// GPU power signal (`[signals.power]`). Disabled by default; unlike
+/// GPU power signal (`[signals.gpu_power]`). Disabled by default; unlike
 /// gpu_temp/cpu_temp there is no top-level fallback for a watts/percent
 /// curve, so `curve` is required by `validate` when enabled.
 #[derive(Debug, Clone, Deserialize)]
@@ -214,7 +214,7 @@ impl Default for GpuPowerConfig {
     }
 }
 
-/// Thermal margin signal (`[signals.margin]`, headroom-to-limit °C).
+/// Thermal margin signal (`[signals.thermal_margin]`, headroom-to-limit °C).
 /// Disabled by default; `curve` is required by `validate` when enabled (no
 /// top-level fallback — margin's X axis isn't a die temperature).
 #[derive(Debug, Clone, Deserialize)]
@@ -296,9 +296,9 @@ pub struct SignalsConfig {
     pub gpu_temp: GpuTempConfig,
     #[serde(default)]
     pub cpu_temp: CpuTempConfig,
-    #[serde(default, rename = "power")]
+    #[serde(default)]
     pub gpu_power: GpuPowerConfig,
-    #[serde(default, rename = "margin")]
+    #[serde(default)]
     pub thermal_margin: MarginConfig,
     #[serde(default)]
     pub mem_temp: MemTempConfig,
@@ -508,7 +508,7 @@ impl Config {
                 .collect();
             if duties.windows(2).any(|w| w[1] > w[0]) {
                 log::warn!(
-                    "signals.margin.curve duty rises with headroom; more thermal headroom will command more fan — is the curve inverted?"
+                    "signals.thermal_margin.curve duty rises with headroom; more thermal headroom will command more fan — is the curve inverted?"
                 );
             }
         }
@@ -672,16 +672,16 @@ impl Config {
             // X axes aren't die temperature), so an empty curve is always a
             // bail when the sub-signal is enabled, not a silent no-op.
             if s.gpu_power.enabled {
-                validate_curve("signals.power.curve", &s.gpu_power.curve)?;
+                validate_curve("signals.gpu_power.curve", &s.gpu_power.curve)?;
                 if !(s.gpu_power.rise_alpha > 0.0 && s.gpu_power.rise_alpha <= 1.0) {
                     bail!(
-                        "signals.power.rise_alpha {} must be in (0.0, 1.0]",
+                        "signals.gpu_power.rise_alpha {} must be in (0.0, 1.0]",
                         s.gpu_power.rise_alpha
                     );
                 }
                 if !(s.gpu_power.fall_alpha > 0.0 && s.gpu_power.fall_alpha <= 1.0) {
                     bail!(
-                        "signals.power.fall_alpha {} must be in (0.0, 1.0]",
+                        "signals.gpu_power.fall_alpha {} must be in (0.0, 1.0]",
                         s.gpu_power.fall_alpha
                     );
                 }
@@ -689,16 +689,16 @@ impl Config {
                     && s.gpu_power.curve.iter().any(|p| p.temp > 200.0)
                 {
                     bail!(
-                        "signals.power.curve has a point > 200 with unit = \"percent_tdp\" — likely a watts/percent mixup"
+                        "signals.gpu_power.curve has a point > 200 with unit = \"percent_tdp\" — likely a watts/percent mixup"
                     );
                 }
             }
 
             if s.thermal_margin.enabled {
-                validate_curve("signals.margin.curve", &s.thermal_margin.curve)?;
+                validate_curve("signals.thermal_margin.curve", &s.thermal_margin.curve)?;
                 if !(s.thermal_margin.alpha > 0.0 && s.thermal_margin.alpha <= 1.0) {
                     bail!(
-                        "signals.margin.alpha {} must be in (0.0, 1.0]",
+                        "signals.thermal_margin.alpha {} must be in (0.0, 1.0]",
                         s.thermal_margin.alpha
                     );
                 }
@@ -1069,22 +1069,22 @@ enabled = true
 enabled = false
 offset_c = 12.0
 
-[signals.power]
+[signals.gpu_power]
 enabled = true
 unit = "percent_tdp"
-[[signals.power.curve]]
+[[signals.gpu_power.curve]]
 temp = 25.0
 duty = 30
-[[signals.power.curve]]
+[[signals.gpu_power.curve]]
 temp = 95.0
 duty = 100
 
-[signals.margin]
+[signals.thermal_margin]
 enabled = true
-[[signals.margin.curve]]
+[[signals.thermal_margin.curve]]
 temp = 5.0
 duty = 100
-[[signals.margin.curve]]
+[[signals.thermal_margin.curve]]
 temp = 35.0
 duty = 30
 
@@ -1131,13 +1131,13 @@ temp = 40.0
 duty = 50
 [signals]
 enabled = true
-[signals.power]
+[signals.gpu_power]
 enabled = true
 unit = "watts"
-[[signals.power.curve]]
+[[signals.gpu_power.curve]]
 value = 120.0
 duty = 30
-[[signals.power.curve]]
+[[signals.gpu_power.curve]]
 value = 560.0
 duty = 100
 "#;
@@ -1174,13 +1174,13 @@ duty = 100
 
     #[test]
     fn rejects_power_enabled_without_curve() {
-        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.power]\nenabled = true\n";
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.gpu_power]\nenabled = true\n";
         assert!(Config::from_str(s).is_err());
     }
 
     #[test]
     fn rejects_margin_enabled_without_curve() {
-        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.margin]\nenabled = true\n";
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.thermal_margin]\nenabled = true\n";
         assert!(Config::from_str(s).is_err());
     }
 
@@ -1206,13 +1206,13 @@ temp = 40.0
 duty = 50
 [signals]
 enabled = true
-[signals.power]
+[signals.gpu_power]
 enabled = true
 unit = "percent_tdp"
-[[signals.power.curve]]
+[[signals.gpu_power.curve]]
 temp = 120.0
 duty = 30
-[[signals.power.curve]]
+[[signals.gpu_power.curve]]
 temp = 560.0
 duty = 100
 "#;

@@ -17,10 +17,12 @@ struct State {
     led_state: u8,
     last_tick: u64,
 
-    // Multi-signal fusion (Wave 5). Keyed by SignalKind::as_str(); a key is
-    // only ever present once the corresponding setter has been called for
-    // that signal this run, so an unavailable signal emits no series at all
-    // (matching how `temps` already behaves when a sensor is missing).
+    // Multi-signal fusion (Wave 5). Keyed by SignalKind::as_str().
+    // `signal_values`, `signal_candidate_duty` and `control_signal` are
+    // replaced wholesale each fusion tick by `set_fusion_frame`, so they
+    // describe the LATEST tick only: a signal that goes away stops emitting
+    // rather than freezing at its last value. (`temps` above is still
+    // insert-only -- legacy behavior, deliberately left alone.)
     signal_values: BTreeMap<&'static str, (f64, &'static str)>,
     signal_candidate_duty: BTreeMap<&'static str, u8>,
     control_signal: Option<&'static str>,
@@ -114,26 +116,42 @@ impl Metrics {
         self.state().last_tick = unix_secs;
     }
 
-    /// Conditioned (smoothed) value of one available input signal.
-    pub fn set_signal_value(&self, signal: SignalKind, v: f64) {
-        self.state()
-            .signal_values
-            .insert(signal.as_str(), (v, signal.unit()));
-    }
-    /// Duty this signal's own curve would command this tick, independent of
-    /// whether it ends up winning the max-of-candidates fusion.
-    pub fn set_candidate_duty(&self, signal: SignalKind, duty: u8) {
-        self.state()
-            .signal_candidate_duty
-            .insert(signal.as_str(), duty);
-    }
-    /// The signal whose candidate duty drove the applied duty this tick.
-    /// Rendered one-hot against every currently-available signal (i.e. every
-    /// signal with a candidate duty registered) rather than as a single
-    /// info-series whose label value changes, which would leave stale
-    /// timeseries behind and break rate()/graphing across a hand-off.
-    pub fn set_control_signal(&self, winner: SignalKind) {
-        self.state().control_signal = Some(winner.as_str());
+    /// Publishes this tick's entire fusion view in one atomic update:
+    /// conditioned signal values, per-signal candidate duties, and the
+    /// winning signal. Both arrays are indexed by `SignalKind::idx()`,
+    /// matching `signals::Conditioned::values` and `signals::Fusion`.
+    ///
+    /// REPLACES rather than merges, and that is the whole point. A signal
+    /// that was present on an earlier tick but is absent now leaves no
+    /// stale series behind, and `winner: None` — a floor-only tick, or
+    /// total signal loss — clears the one-hot instead of leaving the
+    /// previous winner reading 1, which is exactly the degraded condition
+    /// where someone is staring at the dashboard. Taking all three together
+    /// in one call makes that structural: there is no ordering of separate
+    /// setters a caller can get wrong, and no torn frame is observable to a
+    /// concurrent scrape.
+    ///
+    /// The one-hot renders across every signal with a candidate duty in
+    /// THIS frame, rather than as one info-series whose label value
+    /// changes, which would strand a timeseries per hand-off.
+    pub fn set_fusion_frame(
+        &self,
+        values: &[Option<f64>; 5],
+        candidate_duties: &[Option<u8>; 5],
+        winner: Option<SignalKind>,
+    ) {
+        let mut s = self.state();
+        s.signal_values.clear();
+        s.signal_candidate_duty.clear();
+        for &kind in SignalKind::ALL.iter() {
+            if let Some(v) = values[kind.idx()] {
+                s.signal_values.insert(kind.as_str(), (v, kind.unit()));
+            }
+            if let Some(d) = candidate_duties[kind.idx()] {
+                s.signal_candidate_duty.insert(kind.as_str(), d);
+            }
+        }
+        s.control_signal = winner.map(|w| w.as_str());
     }
     /// Enforced GPU power limit, when known. Enables percent-of-limit
     /// dashboards regardless of which unit the power curve itself uses.
@@ -157,6 +175,16 @@ impl Metrics {
             .signal_errors
             .entry(signal.as_str())
             .or_insert(0) += 1;
+    }
+    /// A REAL failure reading NVML's throttle-reason bits. Deliberately not
+    /// a `SignalKind`: throttle drives the duty floor and the alarm ladder's
+    /// near-limit rung, not a fusion curve. It still needs a counter, because
+    /// on a config whose only other signal is `gpu_temp` (which has no error
+    /// counter of its own) a persistently failing throttle read would
+    /// silently disable both safety behaviors with nothing observable above
+    /// `log::debug!`.
+    pub fn inc_throttle_error(&self) {
+        *self.state().signal_errors.entry("throttle").or_insert(0) += 1;
     }
 
     fn healthz(&self) -> bool {
@@ -342,6 +370,24 @@ mod tests {
         Metrics::new(5)
     }
 
+    /// Builds a `set_fusion_frame` argument pair from sparse lists, so a
+    /// test reads as "these signals were present on this tick" rather than
+    /// as five-slot array literals.
+    fn frame(
+        values: &[(SignalKind, f64)],
+        candidates: &[(SignalKind, u8)],
+    ) -> ([Option<f64>; 5], [Option<u8>; 5]) {
+        let mut v: [Option<f64>; 5] = [None; 5];
+        let mut c: [Option<u8>; 5] = [None; 5];
+        for &(k, x) in values {
+            v[k.idx()] = Some(x);
+        }
+        for &(k, d) in candidates {
+            c[k.idx()] = Some(d);
+        }
+        (v, c)
+    }
+
     #[test]
     fn renders_prometheus_text() {
         let m = m();
@@ -467,7 +513,8 @@ mod tests {
     #[test]
     fn signal_value_renders_with_unit_label() {
         let m = m();
-        m.set_signal_value(SignalKind::GpuPower, 412.5);
+        let (v, c) = frame(&[(SignalKind::GpuPower, 412.5)], &[]);
+        m.set_fusion_frame(&v, &c, None);
         let out = m.render();
         assert!(out.contains("# HELP unifand_signal_value"));
         assert!(out.contains("# TYPE unifand_signal_value gauge"));
@@ -477,8 +524,11 @@ mod tests {
     #[test]
     fn candidate_duty_renders_per_signal() {
         let m = m();
-        m.set_candidate_duty(SignalKind::GpuTemp, 55);
-        m.set_candidate_duty(SignalKind::GpuPower, 80);
+        let (v, c) = frame(
+            &[],
+            &[(SignalKind::GpuTemp, 55), (SignalKind::GpuPower, 80)],
+        );
+        m.set_fusion_frame(&v, &c, None);
         let out = m.render();
         assert!(out.contains("# TYPE unifand_signal_candidate_duty_percent gauge"));
         assert!(out.contains("unifand_signal_candidate_duty_percent{signal=\"gpu_temp\"} 55"));
@@ -490,9 +540,11 @@ mod tests {
         let m = m();
         // Two available signals (both have a candidate duty); a third
         // (mem_temp) is never registered, i.e. unavailable this run.
-        m.set_candidate_duty(SignalKind::GpuPower, 80);
-        m.set_candidate_duty(SignalKind::GpuTemp, 55);
-        m.set_control_signal(SignalKind::GpuPower);
+        let (v, c) = frame(
+            &[],
+            &[(SignalKind::GpuPower, 80), (SignalKind::GpuTemp, 55)],
+        );
+        m.set_fusion_frame(&v, &c, Some(SignalKind::GpuPower));
         let out = m.render();
         assert!(out.contains("# TYPE unifand_control_signal gauge"));
         assert!(out.contains("unifand_control_signal{signal=\"gpu_power\"} 1"));
@@ -503,9 +555,11 @@ mod tests {
     #[test]
     fn absent_signal_emits_no_series() {
         let m = m();
-        m.set_signal_value(SignalKind::GpuPower, 100.0);
-        m.set_candidate_duty(SignalKind::GpuPower, 60);
-        m.set_control_signal(SignalKind::GpuPower);
+        let (v, c) = frame(
+            &[(SignalKind::GpuPower, 100.0)],
+            &[(SignalKind::GpuPower, 60)],
+        );
+        m.set_fusion_frame(&v, &c, Some(SignalKind::GpuPower));
         let out = m.render();
         // mem_temp is never touched -> absent, not zero.
         assert!(!out.contains("signal=\"mem_temp\""));
@@ -526,6 +580,69 @@ mod tests {
         assert!(out.contains("unifand_throttle_active{reason=\"hw_thermal\"} 0"));
         assert!(out.contains("unifand_throttle_active{reason=\"hw_power_brake\"} 0"));
         assert!(out.contains("unifand_throttle_active{reason=\"sw_power_cap\"} 1"));
+    }
+
+    #[test]
+    fn no_winner_clears_the_one_hot_instead_of_latching_the_last_one() {
+        // Regression: set_control_signal used to be call-gated on a Some
+        // winner and never cleared, so a floor-only tick (throttle floor
+        // drives duty, no curve candidate wins) kept reporting the PREVIOUS
+        // winner as 1 -- in exactly the degraded state a reader cares about.
+        let m = m();
+        let (v, c) = frame(
+            &[(SignalKind::GpuPower, 500.0)],
+            &[(SignalKind::GpuPower, 90), (SignalKind::GpuTemp, 40)],
+        );
+        m.set_fusion_frame(&v, &c, Some(SignalKind::GpuPower));
+        assert!(m
+            .render()
+            .contains("unifand_control_signal{signal=\"gpu_power\"} 1"));
+
+        // Next tick: same candidates, but nothing won.
+        m.set_fusion_frame(&v, &c, None);
+        let out = m.render();
+        assert!(
+            out.contains("unifand_control_signal{signal=\"gpu_power\"} 0"),
+            "stale winner still latched at 1:\n{out}"
+        );
+        assert!(out.contains("unifand_control_signal{signal=\"gpu_temp\"} 0"));
+    }
+
+    #[test]
+    fn a_signal_that_disappears_stops_emitting_series() {
+        // The frame REPLACES the previous tick's view; a signal present at
+        // t0 and gone at t1 must not freeze at its last value.
+        let m = m();
+        let (v0, c0) = frame(
+            &[(SignalKind::GpuPower, 412.5), (SignalKind::GpuTemp, 71.0)],
+            &[(SignalKind::GpuPower, 80), (SignalKind::GpuTemp, 55)],
+        );
+        m.set_fusion_frame(&v0, &c0, Some(SignalKind::GpuPower));
+        assert!(m.render().contains("signal=\"gpu_power\""));
+
+        let (v1, c1) = frame(&[(SignalKind::GpuTemp, 71.0)], &[(SignalKind::GpuTemp, 55)]);
+        m.set_fusion_frame(&v1, &c1, Some(SignalKind::GpuTemp));
+        let out = m.render();
+        assert!(
+            !out.contains("signal=\"gpu_power\""),
+            "gpu_power series survived its own disappearance:\n{out}"
+        );
+        assert!(out.contains("unifand_signal_value{signal=\"gpu_temp\",unit=\"celsius\"} 71"));
+        assert!(out.contains("unifand_control_signal{signal=\"gpu_temp\"} 1"));
+    }
+
+    #[test]
+    fn throttle_read_failures_count_under_their_own_label() {
+        // Throttle has no SignalKind, but it gates the duty floor and the
+        // alarm's near-limit rung, so a failing read must still be visible.
+        let m = m();
+        m.inc_throttle_error();
+        m.inc_throttle_error();
+        m.inc_signal_error(SignalKind::GpuPower);
+        let out = m.render();
+        assert!(out.contains("# TYPE unifand_signal_errors_total counter"));
+        assert!(out.contains("unifand_signal_errors_total{signal=\"throttle\"} 2"));
+        assert!(out.contains("unifand_signal_errors_total{signal=\"gpu_power\"} 1"));
     }
 
     #[test]

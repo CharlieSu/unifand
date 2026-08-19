@@ -73,10 +73,10 @@ fn margin_log_token(margin: MarginSource) -> String {
 /// a fresh NVML multi-signal read. Never touches hardware beyond the one
 /// `read_signals` call; a missing GPU/caps simply yields temps-only readings.
 /// Real (non-`NotSupported`) NVML read failures are folded into
-/// `unifand_signal_errors_total` for the three signals that have a
-/// corresponding `SignalKind` (power, margin, mem_temp) — throttle-reason
-/// reads have no curve-fusion `SignalKind` of their own, so a throttle read
-/// failure is only `log::debug!`-logged by `classify_read`, not counted.
+/// `unifand_signal_errors_total`: power, margin and mem_temp under their own
+/// `SignalKind`, and throttle-reason reads under a bare "throttle" label —
+/// it has no curve-fusion `SignalKind`, but it gates the duty floor and the
+/// alarm's near-limit rung, so its failures must be countable too.
 fn build_signal_readings(
     gpu: &Option<GpuSensor>,
     caps: &Option<GpuCaps>,
@@ -94,6 +94,9 @@ fn build_signal_readings(
             }
             if errors.mem_temp {
                 m.inc_signal_error(SignalKind::MemTemp);
+            }
+            if errors.throttle {
+                m.inc_throttle_error();
             }
             readings
         }
@@ -544,21 +547,16 @@ fn main() -> Result<()> {
 
             let fusion = fuse(&cfg.signals, &cfg.curve, &cond, latched);
 
-            // Metrics hand-off (Wave 5): the candidate-duty setter fires for
-            // EVERY signal fuse() produced a candidate for, winners AND
-            // non-winners — unifand_control_signal's one-hot block is keyed
-            // off these entries.
-            for &kind in SignalKind::ALL.iter() {
-                if let Some(v) = cond.values[kind.idx()] {
-                    m.set_signal_value(kind, v);
-                }
-            }
+            // Metrics hand-off (Wave 5): publish the whole frame at once —
+            // every candidate fuse() produced (winners AND non-winners, since
+            // unifand_control_signal's one-hot is keyed off them) plus the
+            // winner, which is None on a floor-only tick and must clear the
+            // one-hot rather than leave the last winner latched at 1.
+            let mut candidate_duties: [Option<u8>; 5] = [None; 5];
             for candidate in fusion.candidates.iter().flatten() {
-                m.set_candidate_duty(candidate.kind, candidate.duty);
+                candidate_duties[candidate.kind.idx()] = Some(candidate.duty);
             }
-            if let Some(winner) = fusion.winner {
-                m.set_control_signal(winner);
-            }
+            m.set_fusion_frame(&cond.values, &candidate_duties, fusion.winner);
             if let Some(limit) = cond.gpu_power_limit_w {
                 m.set_gpu_power_limit_watts(limit);
             }
