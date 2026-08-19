@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/) —
 with the pre-1.0 caveat that minor version bumps may carry breaking changes
 (protocol/metric shape changes), called out explicitly below.
 
+## [0.6.1](https://github.com/CharlieSu/unifand/compare/v0.6.0...v0.6.1) (2026-08-19)
+
+
+### Bug Fixes
+
+* **contrib:** aggregate dashboard queries by node to survive pod churn ([#16](https://github.com/CharlieSu/unifand/issues/16)) ([b7fcb65](https://github.com/CharlieSu/unifand/commit/b7fcb656bffb036015721462e2c2a8092e2881e4))
+
 ## [0.6.0](https://github.com/CharlieSu/unifand/compare/v0.5.1...v0.6.0) (2026-08-19)
 
 
