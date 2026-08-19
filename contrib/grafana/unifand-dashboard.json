@@ -104,7 +104,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_fan_rpm",
+          "expr": "max by (node, channel) (unifand_fan_rpm)",
           "refId": "A",
           "legendFormat": "ch{{channel}}"
         }
@@ -153,7 +153,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_duty_percent",
+          "expr": "max by (node, channel) (unifand_duty_percent)",
           "refId": "A",
           "legendFormat": "ch{{channel}}"
         }
@@ -202,7 +202,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_temp_celsius",
+          "expr": "max by (node, source) (unifand_temp_celsius)",
           "refId": "A",
           "legendFormat": "{{source}}"
         }
@@ -299,8 +299,9 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_led_state",
-          "refId": "A"
+          "expr": "max by (node) (unifand_led_state)",
+          "refId": "A",
+          "instant": true
         }
       ],
       "description": "Mirrors alarm.rs state_code(): 0 Normal, 1 SustainedHot, 2 NearLimit, 3 Fault."
@@ -378,8 +379,9 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_degraded",
-          "refId": "A"
+          "expr": "max by (node) (unifand_degraded)",
+          "refId": "A",
+          "instant": true
         }
       ]
     },
@@ -456,8 +458,9 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_fallback_active",
-          "refId": "A"
+          "expr": "max by (node) (unifand_fallback_active)",
+          "refId": "A",
+          "instant": true
         }
       ],
       "description": "1 when all sensors are lost and the daemon is holding fallback_duty."
@@ -535,8 +538,9 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_hub_present",
-          "refId": "A"
+          "expr": "min by (node) (unifand_hub_present)",
+          "refId": "A",
+          "instant": true
         }
       ]
     },
@@ -601,8 +605,9 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "time() - unifand_last_tick_timestamp_seconds",
-          "refId": "A"
+          "expr": "time() - max by (node) (unifand_last_tick_timestamp_seconds)",
+          "refId": "A",
+          "instant": true
         }
       ],
       "description": "Same signal /healthz uses. Alert if this exceeds 3x poll_interval_secs (default 15s)."
@@ -638,7 +643,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_build_info",
+          "expr": "max by (node, version) (unifand_build_info)",
           "refId": "A",
           "instant": true,
           "format": "table"
@@ -689,7 +694,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "rate(unifand_hid_errors_total[5m])",
+          "expr": "max by (node, kind) (rate(unifand_hid_errors_total[5m]))",
           "refId": "A",
           "legendFormat": "{{kind}}"
         }
@@ -739,7 +744,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "rate(unifand_rgb_errors_total[5m])",
+          "expr": "max by (node) (rate(unifand_rgb_errors_total[5m]))",
           "refId": "A",
           "legendFormat": "errors"
         }
@@ -789,7 +794,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_signal_candidate_duty_percent",
+          "expr": "max by (node, signal) (unifand_signal_candidate_duty_percent)",
           "refId": "A",
           "legendFormat": "{{signal}}"
         }
@@ -839,7 +844,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_control_signal",
+          "expr": "max by (node, signal) (unifand_control_signal)",
           "refId": "A",
           "legendFormat": "{{signal}}"
         }
@@ -889,7 +894,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_signal_value{signal=\"gpu_power\"}",
+          "expr": "max by (node) (unifand_signal_value{signal=\"gpu_power\"})",
           "refId": "A",
           "legendFormat": "power (conditioned)"
         },
@@ -898,7 +903,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_gpu_power_limit_watts",
+          "expr": "max by (node) (unifand_gpu_power_limit_watts)",
           "refId": "B",
           "legendFormat": "enforced limit"
         }
@@ -948,7 +953,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_throttle_active",
+          "expr": "max by (node, reason) (unifand_throttle_active)",
           "refId": "A",
           "legendFormat": "{{reason}}"
         },
@@ -957,7 +962,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "unifand_throttle_floor_active",
+          "expr": "max by (node) (unifand_throttle_floor_active)",
           "refId": "B",
           "legendFormat": "floor active"
         }
@@ -1007,7 +1012,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "rate(unifand_signal_errors_total[5m])",
+          "expr": "max by (node, signal) (rate(unifand_signal_errors_total[5m]))",
           "refId": "A",
           "legendFormat": "{{signal}}"
         }
