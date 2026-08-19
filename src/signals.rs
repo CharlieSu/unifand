@@ -426,6 +426,17 @@ pub struct Fusion {
 /// is a hardware safety net, not dependent on any one signal being
 /// available). `winner` names the candidate that set the (pre-floor) max,
 /// or `None` when only the floor produced a target.
+///
+/// CONTRACT: `fuse` trusts `cond.values` to already be plausibility-filtered
+/// and finite — that's `SignalConditioner`'s job, not this function's. A
+/// `NaN` (or other non-finite value) injected directly into `Conditioned`,
+/// bypassing `SignalConditioner`, would fall through `interpolate`'s
+/// less-than/greater-than-or-equal comparisons (all `false` against `NaN`)
+/// to the loop body, then to the final `last.duty` fallback — silently
+/// producing a plausible-looking duty instead of an error. Relevant to
+/// Wave 7 callers: always route readings through `SignalConditioner::update`
+/// before calling `fuse`, never construct `Conditioned` by hand from raw
+/// sensor output.
 pub fn fuse(
     cfg: &SignalsConfig,
     top_curve: &[CurvePoint],
@@ -624,6 +635,92 @@ mod tests {
         assert!(!plausible(SignalKind::ThermalMargin, -41.0));
     }
 
+    // -- SignalConditioner ---------------------------------------------------
+
+    #[test]
+    fn conditioner_drops_implausible_sample_without_poisoning_filter() {
+        let cfg = SignalsConfig::default(); // rise 0.5 / fall 0.1
+        let mut cond = SignalConditioner::new(&cfg);
+
+        // Prime with a plausible reading; first sample seeds the filter directly.
+        let primed = cond.update(&SignalReadings {
+            mem_temp_c: Some(40.0),
+            ..Default::default()
+        });
+        assert_eq!(primed.values[SignalKind::MemTemp.idx()], Some(40.0));
+
+        // The real DCGM failure mode: memory temp reported as a constant 0
+        // (Ok(0), not an error). plausible() must reject it, and the
+        // conditioner must feed the filter `None`, not the bad 0.0 sample —
+        // the conditioned value must stay exactly at the primed value, not
+        // be dragged toward zero.
+        let after_bad_sample = cond.update(&SignalReadings {
+            mem_temp_c: Some(0.0),
+            ..Default::default()
+        });
+        assert_eq!(
+            after_bad_sample.values[SignalKind::MemTemp.idx()],
+            None,
+            "an implausible sample must not produce a fresh conditioned reading"
+        );
+
+        // Filter state itself must be untouched by the implausible sample:
+        // the next *plausible* sample must blend from the primed value
+        // (40.0), not from a poisoned/zeroed state.
+        let after_good_sample = cond.update(&SignalReadings {
+            mem_temp_c: Some(50.0), // rise: 0.5*50 + 0.5*40 = 45.0
+            ..Default::default()
+        });
+        assert_eq!(
+            after_good_sample.values[SignalKind::MemTemp.idx()],
+            Some(45.0)
+        );
+    }
+
+    #[test]
+    fn conditioner_reset_gpu_preserves_cpu_filter() {
+        let cfg = SignalsConfig::default(); // rise 0.5 / fall 0.1
+        let mut cond = SignalConditioner::new(&cfg);
+
+        // Prime all five filters (first sample seeds each directly).
+        cond.update(&SignalReadings {
+            mem_temp_c: Some(40.0),
+            thermal_margin_c: Some(50.0),
+            gpu_temp_c: Some(60.0),
+            gpu_power_w: Some(100.0),
+            cpu_temp_c: Some(70.0),
+            ..Default::default()
+        });
+
+        cond.reset_gpu();
+
+        // Feed a second, distinct sample to every signal. The four
+        // GPU-derived filters were reset, so they must seed directly on
+        // this new sample (conditioned value == raw sample). CpuTemp was
+        // NOT reset, so it must blend from its held state instead.
+        let after_reset = cond.update(&SignalReadings {
+            mem_temp_c: Some(42.0),
+            thermal_margin_c: Some(52.0),
+            gpu_temp_c: Some(62.0),
+            gpu_power_w: Some(105.0),
+            cpu_temp_c: Some(75.0), // rise: 0.5*75 + 0.5*70 = 72.5
+            ..Default::default()
+        });
+
+        assert_eq!(after_reset.values[SignalKind::MemTemp.idx()], Some(42.0));
+        assert_eq!(
+            after_reset.values[SignalKind::ThermalMargin.idx()],
+            Some(52.0)
+        );
+        assert_eq!(after_reset.values[SignalKind::GpuTemp.idx()], Some(62.0));
+        assert_eq!(after_reset.values[SignalKind::GpuPower.idx()], Some(105.0));
+        assert_eq!(
+            after_reset.values[SignalKind::CpuTemp.idx()],
+            Some(72.5),
+            "CpuTemp filter must survive reset_gpu() and keep blending from held state"
+        );
+    }
+
     // -- fuse ----------------------------------------------------------------
 
     #[test]
@@ -757,6 +854,20 @@ mod tests {
         let fusion2 = fuse(&cfg, &linear_curve(), &cond, false);
         assert_eq!(fusion2.target, None);
         assert!(fusion2.candidates[SignalKind::GpuPower.idx()].is_none());
+
+        // limit == 0.0 must also skip, not divide-by-zero into an infinite
+        // or NaN percentage.
+        cond.gpu_power_limit_w = Some(0.0);
+        let fusion3 = fuse(&cfg, &linear_curve(), &cond, false);
+        assert_eq!(fusion3.target, None);
+        assert!(fusion3.candidates[SignalKind::GpuPower.idx()].is_none());
+
+        // A negative limit is nonsensical hardware state; must also skip
+        // rather than reinterpret as watts or produce a negative percentage.
+        cond.gpu_power_limit_w = Some(-10.0);
+        let fusion4 = fuse(&cfg, &linear_curve(), &cond, false);
+        assert_eq!(fusion4.target, None);
+        assert!(fusion4.candidates[SignalKind::GpuPower.idx()].is_none());
     }
 
     #[test]
@@ -783,6 +894,19 @@ mod tests {
         assert_eq!(fusion2.target, Some(90));
         assert!(!fusion2.floor_applied);
         assert_eq!(fusion2.winner, Some(SignalKind::GpuTemp));
+
+        // Floor exactly EQUAL to the candidate max must not count as having
+        // "raised" it — max(90, 90) == 90 is not a strict raise.
+        let mut cfg3 = cfg.clone();
+        cfg3.throttle.floor_duty = 90;
+        cfg3.gpu_temp.enabled = true;
+        let mut cond3 = Conditioned::default();
+        cond3.values[SignalKind::GpuTemp.idx()] = Some(90.0); // duty 90 via top_curve
+
+        let fusion3 = fuse(&cfg3, &linear_curve(), &cond3, true);
+        assert_eq!(fusion3.target, Some(90));
+        assert!(!fusion3.floor_applied);
+        assert_eq!(fusion3.winner, Some(SignalKind::GpuTemp));
     }
 
     // -- ThrottleLatch -----------------------------------------------------
