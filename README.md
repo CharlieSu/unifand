@@ -336,8 +336,11 @@ read-only and doesn't include the staged NVIDIA libraries, so the probe
 errors (and its stderr shares the container's log pipe), then everything
 resolves via direct loader paths anyway. Harmless as long as the next lines
 show `gpu(nvml)=true` — which they will. Tracked upstream in
-[siderolabs/extensions#940](https://github.com/siderolabs/extensions/issues/940);
-it disappears once your Talos schematic carries the fixed extension. (The
+[siderolabs/extensions#940](https://github.com/siderolabs/extensions/issues/940),
+closed by a migration to CDI — the line persists for any cluster still using
+the legacy `runtimeClassName: nvidia` + env-var flow (as this project's
+`nvidia-gpu` component does) and goes away only if your cluster adopts the
+CDI device flow. (The
 severe form of the same bug segfaults GPU containers on older
 `nvidia-container-toolkit-lts` versions — if unifand *crashes* at startup on
 Talos rather than just logging this line, read that issue.)
