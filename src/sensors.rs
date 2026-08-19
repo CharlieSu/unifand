@@ -1,10 +1,21 @@
+//! Not yet wired into the control loop (Wave 7 does that), so
+//! `#[allow(dead_code)]` suppresses the expected "never constructed/used"
+//! lint for the Wave 3 multi-signal NVML reads (`GpuCaps`, `MarginSource`,
+//! `SignalErrors`, `GpuSensor::{probe_caps, read_signals,
+//! refresh_power_limit}`, and their helpers) — mirrors `src/signals.rs`.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
+use nvml_wrapper::bitmasks::device::ThrottleReasons;
 use nvml_wrapper::enum_wrappers::device::{TemperatureSensor, TemperatureThreshold};
+use nvml_wrapper::enums::device::SampleValue;
 use nvml_wrapper::error::NvmlError;
 use nvml_wrapper::structs::device::FieldId;
 use nvml_wrapper::sys_exports::field_id;
 use nvml_wrapper::Nvml;
 use std::path::{Path, PathBuf};
+
+use crate::signals::{SignalReadings, ThrottleFlags};
 
 /// Pick the control temperature: hotter of GPU and offset CPU.
 /// Degraded (second element) when the GPU signal is unavailable.
@@ -27,6 +38,98 @@ pub const REDISCOVERY_INTERVAL_TICKS: u32 = 12;
 /// (whether or not it succeeded).
 pub fn should_reprobe(missing_or_failing: bool, ticks_since_probe: u32, interval: u32) -> bool {
     missing_or_failing && ticks_since_probe >= interval
+}
+
+/// Where `GpuSensor::probe_caps` sourced (or failed to source) the thermal
+/// margin signal.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum MarginSource {
+    #[default]
+    Unavailable,
+    /// Dead on nvml-wrapper 0.12.1: NVML fields 193/194/196 report driver
+    /// value type 5, which this crate version's `SampleValue` enum (types
+    /// 0-4 only) cannot decode, so every read comes back
+    /// `Err(UnexpectedVariant(5))`. Kept for a future crate version that can
+    /// decode type 5; `probe_caps` must never select it. See its doc
+    /// comment for the measured evidence.
+    TlimitField,
+    GpuMaxMinusTemp {
+        threshold_c: f64,
+    },
+}
+
+/// GPU multi-signal capabilities detected once by `GpuSensor::probe_caps`,
+/// at init and on re-discovery, rather than re-probed every tick.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct GpuCaps {
+    pub power: bool,
+    pub margin: MarginSource,
+    pub mem_temp: bool,
+    pub throttle: bool,
+    pub power_limit_w: Option<f64>,
+}
+
+/// True only for a REAL read failure (anything other than `NotSupported`)
+/// on the corresponding signal, for the current tick. `NotSupported` is
+/// normal absence, not an error, and never sets these.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SignalErrors {
+    pub power: bool,
+    pub margin: bool,
+    pub mem_temp: bool,
+    pub throttle: bool,
+}
+
+/// Minimum ticks between periodic refreshes of the cached enforced power
+/// limit (~5 min at the default 5 s poll interval). `nvidia-smi -pl` can
+/// change the limit at runtime; reuses the existing `should_reprobe` cadence
+/// helper rather than adding a parallel mechanism.
+pub const POWER_LIMIT_REFRESH_TICKS: u32 = 60;
+
+/// Shared error policy for every NVML signal read: `NotSupported` is normal
+/// absence for silicon that lacks the signal (never logged per-tick, never
+/// counted as an error); any other error is a real failure (`log::debug!`
+/// plus the error flag).
+fn classify_read<T>(result: std::result::Result<T, NvmlError>, error_flag: &mut bool) -> Option<T> {
+    match result {
+        Ok(v) => Some(v),
+        Err(NvmlError::NotSupported) => None,
+        Err(e) => {
+            log::debug!("nvml signal read failed: {e}");
+            *error_flag = true;
+            None
+        }
+    }
+}
+
+/// Pure arithmetic for `MarginSource::GpuMaxMinusTemp`: headroom to the
+/// static GpuMax threshold. Extracted so it's testable without a GPU.
+/// `None` temp (absent or a real read failure) propagates to `None`.
+pub fn margin_from_threshold(threshold_c: f64, temp_c: Option<f64>) -> Option<f64> {
+    temp_c.map(|t| threshold_c - t)
+}
+
+/// Maps the four throttle-reason bits this daemon tracks for fan control
+/// into `ThrottleFlags`. Reasons not tracked here (e.g. `GPU_IDLE`,
+/// `SYNC_BOOST`) must never leak into a tracked flag.
+pub fn throttle_flags(r: ThrottleReasons) -> ThrottleFlags {
+    ThrottleFlags {
+        sw_thermal: r.contains(ThrottleReasons::SW_THERMAL_SLOWDOWN),
+        hw_thermal: r.contains(ThrottleReasons::HW_THERMAL_SLOWDOWN),
+        hw_power_brake: r.contains(ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN),
+        sw_power_cap: r.contains(ThrottleReasons::SW_POWER_CAP),
+    }
+}
+
+/// Extracts the numeric payload from any `SampleValue` variant, handling all
+/// four (including a negative `I64`).
+pub fn sample_to_f64(v: SampleValue) -> f64 {
+    match v {
+        SampleValue::F64(f) => f,
+        SampleValue::U32(u) => u as f64,
+        SampleValue::U64(u) => u as f64,
+        SampleValue::I64(i) => i as f64,
+    }
 }
 
 pub struct CpuSensor {
@@ -77,6 +180,137 @@ impl GpuSensor {
             .temperature(TemperatureSensor::Gpu)
             .context("nvml temperature")?;
         Ok(t as f64)
+    }
+
+    /// One NVML probing round, run at init and on re-discovery: detects each
+    /// multi-signal capability by attempting the read once, rather than
+    /// re-probing per tick.
+    ///
+    /// Margin: `MarginSource::TlimitField` (fields 193/194/196) is DEAD on
+    /// this crate version — nvml-wrapper 0.12.1's `SampleValue` enum only
+    /// decodes NVML value types 0-4, but the driver reports these fields as
+    /// type 5, so every read comes back `Err(UnexpectedVariant(5))`. This is
+    /// a crate limitation, not a hardware one (nvidia-smi reads the same
+    /// fields fine); the variant stays defined for a future crate version,
+    /// but `probe_caps` must never select it. Instead we use
+    /// `temperature_threshold(GpuMax) - temperature(Gpu)`, which the Wave 0
+    /// spike confirmed returns a clean, stable value (`Ok(90)` on this card).
+    pub fn probe_caps(&self) -> GpuCaps {
+        let dev = match self.nvml.device_by_index(0) {
+            Ok(d) => d,
+            Err(_) => return GpuCaps::default(),
+        };
+
+        let power = dev.power_usage().is_ok();
+
+        let margin = match dev.temperature_threshold(TemperatureThreshold::GpuMax) {
+            Ok(t) => MarginSource::GpuMaxMinusTemp {
+                threshold_c: t as f64,
+            },
+            Err(_) => MarginSource::Unavailable,
+        };
+
+        // field 82 MEMORY_TEMP: probed via the batched field API, matching
+        // how read_signals will read it, since a device-attribute-style
+        // probe isn't available for this one.
+        let mem_temp = {
+            let ids = [FieldId(field_id::NVML_FI_DEV_MEMORY_TEMP)];
+            match dev.field_values_for(&ids) {
+                Ok(samples) => samples
+                    .into_iter()
+                    .next()
+                    .map(|s| matches!(s, Ok(fv) if fv.value.is_ok()))
+                    .unwrap_or(false),
+                Err(_) => false,
+            }
+        };
+
+        let throttle = dev.current_throttle_reasons().is_ok();
+
+        let power_limit_w = dev.enforced_power_limit().ok().map(|mw| mw as f64 / 1000.0);
+
+        GpuCaps {
+            power,
+            margin,
+            mem_temp,
+            throttle,
+            power_limit_w,
+        }
+    }
+
+    /// Reads all multi-signal readings for one tick, attempting only the
+    /// capabilities `caps` found present. Never returns `Err` and never
+    /// panics — every individual NVML failure is folded into `SignalErrors`
+    /// (real failures) or silent absence (`NotSupported`, the normal answer
+    /// for silicon that lacks a signal) via `classify_read`.
+    pub fn read_signals(&self, caps: &GpuCaps) -> (SignalReadings, SignalErrors) {
+        let mut readings = SignalReadings::default();
+        let mut errors = SignalErrors::default();
+
+        let dev = match self.nvml.device_by_index(0) {
+            Ok(d) => d,
+            Err(e) => {
+                log::debug!("nvml device_by_index(0) failed: {e}");
+                return (readings, errors);
+            }
+        };
+
+        readings.gpu_power_limit_w = caps.power_limit_w;
+
+        if caps.power {
+            readings.gpu_power_w = classify_read(
+                dev.power_usage().map(|mw| mw as f64 / 1000.0),
+                &mut errors.power,
+            );
+        }
+
+        if let MarginSource::GpuMaxMinusTemp { threshold_c } = caps.margin {
+            let temp = classify_read(
+                dev.temperature(TemperatureSensor::Gpu).map(|t| t as f64),
+                &mut errors.margin,
+            );
+            readings.thermal_margin_c = margin_from_threshold(threshold_c, temp);
+        }
+
+        if caps.mem_temp {
+            let ids = [FieldId(field_id::NVML_FI_DEV_MEMORY_TEMP)];
+            let result: std::result::Result<f64, NvmlError> = match dev.field_values_for(&ids) {
+                Ok(samples) => match samples.into_iter().next() {
+                    Some(Ok(fv)) => fv.value.map(sample_to_f64),
+                    Some(Err(e)) => Err(e),
+                    None => Err(NvmlError::Unknown),
+                },
+                Err(e) => Err(e),
+            };
+            readings.mem_temp_c = classify_read(result, &mut errors.mem_temp);
+        }
+
+        if caps.throttle {
+            let result = dev.current_throttle_reasons();
+            match &result {
+                Ok(r) => readings.throttle = throttle_flags(*r),
+                Err(NvmlError::NotSupported) => {}
+                Err(e) => {
+                    log::debug!("nvml current_throttle_reasons failed: {e}");
+                    errors.throttle = true;
+                }
+            }
+        }
+
+        (readings, errors)
+    }
+
+    /// Re-reads `enforced_power_limit` into `caps.power_limit_w`.
+    /// `nvidia-smi -pl` can change the enforced limit at runtime, and a
+    /// stale cached value would silently rescale a `percent_tdp` curve.
+    /// Called on the `POWER_LIMIT_REFRESH_TICKS` cadence via the existing
+    /// `should_reprobe` helper, not a parallel mechanism.
+    pub fn refresh_power_limit(&self, caps: &mut GpuCaps) {
+        let dev = match self.nvml.device_by_index(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        caps.power_limit_w = dev.enforced_power_limit().ok().map(|mw| mw as f64 / 1000.0);
     }
 
     /// Read-only capability/diagnostic dump for `--probe-gpu`. Never panics
@@ -473,5 +707,98 @@ mod tests {
         // GPU_MAX_TLIMIT (field 196) is I64(-3): the derived margin line
         // should surface that negative headroom directly.
         assert!(out.contains("derived.margin_via_field196_c=-3"));
+    }
+
+    // -- Wave 3: NVML power, thermal margin, throttle --------------------
+
+    #[test]
+    fn sample_to_f64_handles_all_variants() {
+        assert_eq!(sample_to_f64(SampleValue::F64(1.5)), 1.5);
+        assert_eq!(sample_to_f64(SampleValue::U32(42)), 42.0);
+        assert_eq!(sample_to_f64(SampleValue::U64(99)), 99.0);
+        assert_eq!(sample_to_f64(SampleValue::I64(-3)), -3.0);
+    }
+
+    #[test]
+    fn throttle_flags_maps_each_bit() {
+        assert_eq!(
+            throttle_flags(ThrottleReasons::SW_THERMAL_SLOWDOWN),
+            ThrottleFlags {
+                sw_thermal: true,
+                hw_thermal: false,
+                hw_power_brake: false,
+                sw_power_cap: false,
+            }
+        );
+        assert_eq!(
+            throttle_flags(ThrottleReasons::HW_THERMAL_SLOWDOWN),
+            ThrottleFlags {
+                sw_thermal: false,
+                hw_thermal: true,
+                hw_power_brake: false,
+                sw_power_cap: false,
+            }
+        );
+        assert_eq!(
+            throttle_flags(ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN),
+            ThrottleFlags {
+                sw_thermal: false,
+                hw_thermal: false,
+                hw_power_brake: true,
+                sw_power_cap: false,
+            }
+        );
+        assert_eq!(
+            throttle_flags(ThrottleReasons::SW_POWER_CAP),
+            ThrottleFlags {
+                sw_thermal: false,
+                hw_thermal: false,
+                hw_power_brake: false,
+                sw_power_cap: true,
+            }
+        );
+
+        // Untracked bits (GPU_IDLE, SYNC_BOOST) must not leak into any
+        // tracked flag.
+        let untracked = ThrottleReasons::GPU_IDLE | ThrottleReasons::SYNC_BOOST;
+        assert_eq!(throttle_flags(untracked), ThrottleFlags::default());
+    }
+
+    #[test]
+    fn throttle_flags_any_of_matches_configured_reasons() {
+        use crate::config::ThrottleReason;
+
+        let flags = throttle_flags(ThrottleReasons::SW_POWER_CAP);
+        // sw_power_cap is set on the raw flags, but not in the configured
+        // reason list -> any_of must be false.
+        assert!(!flags.any_of(&[ThrottleReason::SwThermal, ThrottleReason::HwThermal]));
+        assert!(flags.any_of(&[ThrottleReason::SwPowerCap]));
+    }
+
+    #[test]
+    fn power_limit_refresh_cadence() {
+        assert!(!should_reprobe(true, 59, POWER_LIMIT_REFRESH_TICKS));
+        assert!(should_reprobe(true, 60, POWER_LIMIT_REFRESH_TICKS));
+    }
+
+    #[test]
+    fn gpu_caps_default_is_all_unavailable() {
+        let caps = GpuCaps::default();
+        assert_eq!(
+            caps,
+            GpuCaps {
+                power: false,
+                margin: MarginSource::Unavailable,
+                mem_temp: false,
+                throttle: false,
+                power_limit_w: None,
+            }
+        );
+    }
+
+    #[test]
+    fn margin_from_threshold_computes_headroom() {
+        assert_eq!(margin_from_threshold(90.0, Some(39.0)), Some(51.0));
+        assert_eq!(margin_from_threshold(90.0, None), None);
     }
 }
