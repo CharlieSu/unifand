@@ -323,6 +323,19 @@ The signals, and what was actually measured about them (RTX 5090 FE,
   sitting in the heatsink. `unit = "percent_tdp"` denominates the curve in
   percent of the card's enforced power limit and is portable across cards;
   `"watts"` is absolute and must be retuned per card.
+
+  There is a second, blunter argument for weighting power at all, measured
+  across a real batched-inference release: **die temperature is a volatile
+  observable.**
+  It swung 82 → 69 → 78 → 68 °C inside 30 s as batches started and stopped,
+  which moved its candidate duty by up to **32 points in a single 5 s tick**
+  (mean 8.4). Power's candidate moved at most 6 points a tick (mean 3.9) over
+  the same window. Fed straight to the fans, the die-temp signal is what you
+  would *hear*; the fused output instead descended monotonically — 100, 93,
+  88, 83, 77, 71, 66, 60, 52, 44, 39 — never exceeding the slew limit. Across
+  that release the power candidate sat above the die-temp candidate on 17 of
+  21 ticks, by a mean of 14 duty points and a peak of 29: fans kept purging
+  the heatsink while the die had already cooled.
 - **Thermal margin** (`[signals.thermal_margin]`) is headroom in °C to the
   card's own thermal limit, with an inverted curve (less headroom → more
   fan). Be clear about what this is: on a card with a static thermal limit
