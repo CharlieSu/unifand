@@ -28,6 +28,27 @@ pub struct AlarmInputs {
     pub fallback_active: bool,
 }
 
+/// Multi-signal thermal context, layered onto `AlarmInputs` via `tick_with`
+/// rather than added as new `AlarmInputs` fields — `AlarmInputs` is used via
+/// inline struct literals in the pre-existing test suite, and any new field
+/// there would break all of them. `Default` (both `None`/`false`) is exactly
+/// the legacy behavior: `tick()` delegates to `tick_with` with defaults, so
+/// callers that never learned about GPU-reported margin or throttle state
+/// see no change at all.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThermalHints {
+    /// Headroom to the card's own reported limit. `None` = unavailable —
+    /// must NEVER trigger NearLimit, or a card that doesn't report headroom
+    /// would sit permanently in NearLimit.
+    pub thermal_margin_c: Option<f64>,
+    /// A thermal throttle reason is active or still within its hold window.
+    /// This does NOT map to Fault: Fault means "lost sensors, flying blind"
+    /// and has its own LED signature; thermal throttling is a normal (if
+    /// urgent) operating condition the card itself is already responding
+    /// to, so it only raises the NearLimit rung.
+    pub thermal_throttling: bool,
+}
+
 fn tuple3(a: [u8; 3]) -> (u8, u8, u8) {
     (a[0], a[1], a[2])
 }
@@ -46,6 +67,11 @@ pub struct AlarmMachine {
     sustained_hot_c: f64,
     sustained_after_secs: u64,
     near_limit_temp: f64,
+    /// Same knob as `near_limit_temp` (`cfg.near_limit_margin_c`), reused
+    /// rather than a new config field — "within N degrees of the limit" is
+    /// semantically identical whether measured against the curve's own top
+    /// temperature or the card's self-reported headroom.
+    near_limit_margin_c: f64,
     escalate_every_secs: u64,
     cooldown_secs: u64,
     alert_color: (u8, u8, u8),
@@ -71,6 +97,7 @@ impl AlarmMachine {
             sustained_hot_c: cfg.sustained_hot_c,
             sustained_after_secs: cfg.sustained_after_secs,
             near_limit_temp: curve_max_temp - cfg.near_limit_margin_c,
+            near_limit_margin_c: cfg.near_limit_margin_c,
             escalate_every_secs: cfg.escalate_every_secs.max(1),
             cooldown_secs: cfg.cooldown_secs,
             alert_color: tuple3(cfg.alert_color),
@@ -91,7 +118,23 @@ impl AlarmMachine {
     /// elapsed = seconds since the previous tick() call.
     /// Returns Some(state-name) when the ALARM STATE changed this tick
     /// (for logging); LED output is read via led(), which the loop diffs.
+    ///
+    /// Unchanged signature/behavior: delegates to `tick_with` with
+    /// all-absent thermal hints, so every pre-existing caller (and the 8
+    /// pre-existing tests) sees exactly the legacy trigger set.
     pub fn tick(&mut self, inputs: &AlarmInputs, elapsed: u64) -> Option<&'static str> {
+        self.tick_with(inputs, &ThermalHints::default(), elapsed)
+    }
+
+    /// Same as `tick`, but also considers multi-signal thermal context: a
+    /// low reported margin or active thermal throttling raises the
+    /// NearLimit rung even when `control_temp`/`duty` alone would not.
+    pub fn tick_with(
+        &mut self,
+        inputs: &AlarmInputs,
+        hints: &ThermalHints,
+        elapsed: u64,
+    ) -> Option<&'static str> {
         if !self.enabled {
             return None;
         }
@@ -111,7 +154,11 @@ impl AlarmMachine {
         let near_limit_trigger = inputs.duty >= 100
             || inputs
                 .control_temp
-                .is_some_and(|t| t >= self.near_limit_temp);
+                .is_some_and(|t| t >= self.near_limit_temp)
+            || hints
+                .thermal_margin_c
+                .is_some_and(|m| m <= self.near_limit_margin_c)
+            || hints.thermal_throttling;
         let sustained_trigger = self.hot_secs >= self.sustained_after_secs;
 
         let prev = self.state;
@@ -323,5 +370,80 @@ mod tests {
         assert_eq!(m.state_code(), 0);
         m.tick(&inp(76.0, 70), 65); // 60+65 >= 120 across the gap
         assert_eq!(m.state_code(), 1);
+    }
+
+    #[test]
+    fn tick_matches_tick_with_default_hints() {
+        let mut a = AlarmMachine::new(&cfg(), 80.0);
+        let mut b = AlarmMachine::new(&cfg(), 80.0);
+        let hints = ThermalHints::default();
+        let steps: &[(f64, u8, u64)] = &[
+            (60.0, 40, 5),   // Normal
+            (76.0, 70, 130), // SustainedHot (dwell exceeded)
+            (78.0, 100, 5),  // NearLimit (escalates immediately)
+            (60.0, 50, 30),  // clearing, within cooldown
+            (60.0, 50, 35),  // cooldown exceeded -> de-escalates
+        ];
+        for (temp, duty, elapsed) in steps.iter().copied() {
+            let inputs = inp(temp, duty);
+            let ra = a.tick(&inputs, elapsed);
+            let rb = b.tick_with(&inputs, &hints, elapsed);
+            assert_eq!(ra, rb);
+            assert_eq!(a.state_code(), b.state_code());
+        }
+    }
+
+    #[test]
+    fn low_thermal_margin_triggers_near_limit() {
+        let mut m = AlarmMachine::new(&cfg(), 80.0);
+        let hints = ThermalHints {
+            thermal_margin_c: Some(2.0), // <= near_limit_margin_c (3.0)
+            thermal_throttling: false,
+        };
+        m.tick_with(&inp(40.0, 50), &hints, 5);
+        assert_eq!(m.state_code(), 2);
+    }
+
+    #[test]
+    fn thermal_throttling_triggers_near_limit_when_cool() {
+        let mut m = AlarmMachine::new(&cfg(), 80.0);
+        let hints = ThermalHints {
+            thermal_margin_c: None,
+            thermal_throttling: true,
+        };
+        m.tick_with(&inp(60.0, 40), &hints, 5);
+        assert_eq!(m.state_code(), 2); // proves independence from temp/duty
+    }
+
+    #[test]
+    fn absent_margin_does_not_trigger_near_limit() {
+        let mut m = AlarmMachine::new(&cfg(), 80.0);
+        let hints = ThermalHints {
+            thermal_margin_c: None,
+            thermal_throttling: false,
+        };
+        m.tick_with(&inp(40.0, 40), &hints, 5);
+        assert_eq!(m.state_code(), 0);
+    }
+
+    #[test]
+    fn margin_recovery_deescalates_after_cooldown() {
+        let mut m = AlarmMachine::new(&cfg(), 80.0);
+        let low = ThermalHints {
+            thermal_margin_c: Some(2.0),
+            thermal_throttling: false,
+        };
+        m.tick_with(&inp(60.0, 50), &low, 5);
+        assert_eq!(m.state_code(), 2);
+
+        let recovered = ThermalHints {
+            thermal_margin_c: Some(25.0), // well above near_limit_margin_c
+            thermal_throttling: false,
+        };
+        m.tick_with(&inp(60.0, 50), &recovered, 30);
+        assert_eq!(m.state_code(), 2); // cleared only 30s < 60s cooldown
+
+        m.tick_with(&inp(60.0, 50), &recovered, 35);
+        assert_eq!(m.state_code(), 0); // 65s clear -> drops (not sustained)
     }
 }
