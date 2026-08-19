@@ -20,7 +20,13 @@ contrib/
 
 `grafana/unifand-dashboard.json` is a raw, ecosystem-neutral Grafana
 dashboard — fan RPM, duty %, temperatures, the alarm-ladder state, error
-rates, and a build-info panel. It carries an `__inputs` block for a
+rates, and a build-info panel, plus a multi-signal fusion row: per-signal
+candidate duty overlaid (shows which signal is winning), the
+`unifand_control_signal` one-hot (who is driving the fans right now), GPU
+power against its enforced limit, throttle-reason bits with the duty
+floor, and per-signal read-error rates. The fusion panels are simply
+empty on a daemon running with `[signals]` disabled — those series aren't
+emitted at all. It carries an `__inputs` block for a
 `${DS_PROMETHEUS}` datasource variable, so Grafana's import flow will prompt
 you to pick a datasource rather than assuming a "default" one exists.
 Works against Prometheus, VictoriaMetrics (its Grafana datasource plugin
@@ -78,12 +84,20 @@ shape prometheus-operator's `PrometheusRule`, the VictoriaMetrics
 operator's `VMRule`, and standalone Prometheus `rule_files:` all accept.
 The file's header comment shows how to wrap it in either CRD envelope.
 
-Six rules: `UnifandAbsent` (scrape target gone), `UnifandStuck` (control
+Nine rules: `UnifandAbsent` (scrape target gone), `UnifandStuck` (control
 loop wedged — the same signal `/healthz` uses), `UnifandHubMissing` (no SL
 V2 hub found), `UnifandDegraded` (running CPU-only), `UnifandFallbackActive`
-(all sensors lost — the single most important one to page on), and
-`UnifandHidWriteErrors` (duty writes failing). Every `expr` was checked
-against the metric names actually emitted by `src/metrics.rs` at v0.4.0.
+(all sensors lost — the single most important one to page on),
+`UnifandHidWriteErrors` (duty writes failing), `UnifandFanStalled`
+(commanded duty but near-zero RPM), and two that only fire on a daemon
+running with `[signals]` enabled: `UnifandThermalThrottle` (a thermal
+throttle bit held for minutes — never observed in normal operation, so
+treat it as cooling genuinely failing; `sw_power_cap` is deliberately not
+matched, it asserts throughout any sustained load) and
+`UnifandSignalErrors` (`unifand_signal_errors_total` increasing — a
+sensor that should work is failing repeatedly; unsupported sensors are
+silently absent and never counted). Every `expr` was checked against the
+metric names actually emitted by `src/metrics.rs`.
 
 **Loading it:**
 - prometheus-operator: wrap in a `PrometheusRule` (see the file's header

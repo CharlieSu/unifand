@@ -293,6 +293,23 @@ fn main() -> Result<()> {
         );
     }
 
+    // Same shape as the warning above: a knob the config still sets, which
+    // this run will ignore. Someone who tuned hysteresis_c for the legacy
+    // loop should be told it stopped mattering the moment they enabled
+    // fusion, rather than discovering it in the README. Fusion decides in
+    // duty space, so step_toward's temp-moved gate is never armed (see
+    // Controller::decide_target) and change suppression falls back to
+    // min_duty_delta alone. Emitted here, before the --oneshot early return,
+    // so the documented config sanity-check surfaces it too.
+    if cfg.signals.enabled && cfg.hysteresis_c > 0.0 {
+        log::warn!(
+            "hysteresis_c = {:.1} is inert with [signals] enabled — fusion decides in duty \
+             space; change suppression falls back to min_duty_delta = {}",
+            cfg.hysteresis_c,
+            cfg.min_duty_delta
+        );
+    }
+
     let mut cpu = CpuSensor::discover();
     let mut gpu = GpuSensor::init();
     log::info!(

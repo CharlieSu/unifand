@@ -26,6 +26,10 @@
 # unifand_build_info{version}, unifand_last_tick_timestamp_seconds,
 # unifand_hub_present, unifand_degraded, unifand_fallback_active,
 # unifand_hid_errors_total{kind="read"|"write"}.
+# Multi-signal fusion metrics (only emitted with [signals] enabled = true),
+# verified against src/metrics.rs on the feat/multi-signal branch:
+# unifand_throttle_active{reason="sw_thermal"|"hw_thermal"|"hw_power_brake"|"sw_power_cap"},
+# unifand_signal_errors_total{signal}.
 groups:
   - name: unifand
     rules:
@@ -145,3 +149,52 @@ groups:
             unplugged, or the hub may be ignoring commands while still
             answering RPM reads. Check airflow immediately — the daemon
             believes it is cooling.
+
+      # Multi-signal fusion ([signals] enabled = true): sustained thermal
+      # throttling. The throttle floor is a safety net, not a routine path
+      # (no thermal throttle bit was ever observed asserting on the
+      # reference card, even at 84 C with 5 C of headroom) — so any of
+      # these bits held for minutes means cooling is genuinely failing to
+      # keep up. sw_power_cap is deliberately NOT matched: it asserts
+      # continuously under any sustained load (measured 0x4 throughout,
+      # 0x0 at idle) and is normal, not a thermal event.
+      - alert: UnifandThermalThrottle
+        expr: unifand_throttle_active{reason=~"sw_thermal|hw_thermal|hw_power_brake"} == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU thermally throttling ({{ $labels.reason }}) on {{ $labels.instance }}"
+          description: >-
+            unifand_throttle_active{reason="{{ $labels.reason }}"} has been
+            1 for 5 minutes: the GPU (or, via sw_thermal, its memory — the
+            only memory-overtemp signal consumer cards expose) is
+            protecting itself by throttling despite the fans. If
+            [signals.throttle] is enabled the duty floor is already
+            holding fans at floor_duty (check
+            unifand_throttle_floor_active); either way, sustained
+            throttling means airflow, curve tuning, or case cooling is
+            insufficient for the load.
+
+      # Multi-signal fusion: a sensor that should work is failing
+      # repeatedly. NotSupported is never counted (an absent signal is
+      # normal and emits no series at all) — this counter only moves on
+      # real read failures, so any sustained rate is a driver/NVML problem
+      # worth investigating. The signal="throttle" series covers the
+      # throttle-reason read that feeds the duty floor and the alarm
+      # ladder's near-limit rung.
+      - alert: UnifandSignalErrors
+        expr: rate(unifand_signal_errors_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "unifand signal reads failing ({{ $labels.signal }}) on {{ $labels.instance }}"
+          description: >-
+            unifand_signal_errors_total{signal="{{ $labels.signal }}"} has
+            been increasing for 10 minutes. This is a real, repeated read
+            failure — not an unsupported sensor, which is silently absent
+            instead. Fusion degrades gracefully (the failing signal simply
+            stops producing a candidate duty and the remaining signals
+            keep control), but the daemon is flying with one less input;
+            check NVML/driver health on the node.

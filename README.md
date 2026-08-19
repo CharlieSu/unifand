@@ -34,6 +34,11 @@ the hardware, and the responsibility for what ships are mine.
 - **GPU-led fan curve** — control temperature is `max(gpu, cpu - offset)`:
   GPU temp via NVML, CPU temp via the `k10temp` hwmon sensor. Piecewise-linear
   curve, hysteresis, and slew-limited ramps so fans never flutter or lurch.
+- **Multi-signal fusion** (opt-in) — fans can also follow GPU power draw
+  (which leads temperature), thermal headroom to the card's own limit, and
+  the GPU's throttle status, fused raise-only: any signal can raise duty
+  above what die temp asks for, none can lower it. Off by default; see
+  "Multi-signal fusion" below.
 - **Thermal glow** — fan LEDs display a duty-mapped color gradient
   (fully configurable stops, brightness, and quantization). Glance at the
   case, know the load.
@@ -267,7 +272,9 @@ opened, no HID write happens. Two uses:
 One TOML file, mounted from a ConfigMap (the kustomize base generates it from
 `deploy/base/config.toml`; edits roll the pod automatically). Full annotated
 reference: [`examples/config.toml`](examples/config.toml). A silence-tuned
-variant: [`examples/config-quiet.toml`](examples/config-quiet.toml).
+variant: [`examples/config-quiet.toml`](examples/config-quiet.toml). A
+multi-signal starting point (measured curve knees, needs per-card tuning):
+[`examples/config-multisignal.toml`](examples/config-multisignal.toml).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -282,7 +289,79 @@ variant: [`examples/config-quiet.toml`](examples/config-quiet.toml).
 | `[rgb] fans_per_channel` | 6 | LED chain length declared to the hub (start-packet byte 3) — **not cosmetic**; too low leaves the tail fans on a chain dark |
 | `[rgb.fans]` | empty | Optional per-channel override of `fans_per_channel`, e.g. `1 = 3` for a shorter chain on channel 1 |
 | `[rgb.alerts]` | disabled in code, enabled in the shipped config | Alarm ladder thresholds, escalation interval, colors |
+| `[signals]` | disabled | Multi-signal fusion (see below). Absent or `enabled = false` ⇒ behavior is exactly the legacy single-curve loop |
+| `[signals.gpu_temp]` / `[signals.cpu_temp]` | enabled (inert until `[signals]` is) | Die-temp signals: optional own `curve` (falls back to the top-level `[[curve]]`), EWMA `alpha` (1.0 = off), CPU `offset_c` (10.0) |
+| `[signals.gpu_power]` | disabled | Power-draw curve; `unit` = `"watts"` (default) or `"percent_tdp"` (portable); asymmetric `rise_alpha`/`fall_alpha` (0.5/0.1) |
+| `[signals.thermal_margin]` | disabled | Inverted curve over headroom °C to the card's thermal limit; `alpha` 0.4 |
+| `[signals.mem_temp]` | disabled | Memory-junction-temp curve — NVML doesn't expose it on most consumer cards, so it ships off |
+| `[signals.throttle]` | disabled | Duty floor while the GPU reports a throttle `reasons` bit: `floor_duty` 85, `hold_secs` 30 |
 | `metrics.listen` | `0.0.0.0:9877` | Prometheus endpoint |
+
+### Multi-signal fusion
+
+With `[signals] enabled = true`, the single temperature-to-duty curve
+becomes one voice among several. Each enabled signal is read per tick,
+filtered, and mapped through its own piecewise-linear curve to a candidate
+duty; the applied target is the **maximum** of the candidates. Fusion is
+**raise-only**: a signal can raise duty above what die temperature asks
+for, but nothing can lower it below the hottest signal's demand. The
+feature is off by default — with `[signals]` absent or `enabled = false`,
+behavior is exactly as before: the legacy control path runs unchanged, and
+the only trace in the scrape output is a constant
+`unifand_throttle_floor_active 0`.
+
+The signals, and what was actually measured about them (RTX 5090 FE,
+575 W enforced limit):
+
+- **GPU power draw** (`[signals.gpu_power]`) is genuinely independent of
+  die temperature, and it *leads* it: on load release, power shed ~96% of
+  its range in ~20 s while die temp had shed about half and kept decaying
+  for 40+ s. That measurement justifies two design choices at once —
+  raise-only fusion, and the asymmetric filter (`rise_alpha` 0.5 /
+  `fall_alpha` 0.1: fast attack, slow release). A symmetric filter would
+  have dropped the fans the moment the job ended, with ~68 °C still
+  sitting in the heatsink. `unit = "percent_tdp"` denominates the curve in
+  percent of the card's enforced power limit and is portable across cards;
+  `"watts"` is absolute and must be retuned per card.
+- **Thermal margin** (`[signals.thermal_margin]`) is headroom in °C to the
+  card's own thermal limit, with an inverted curve (less headroom → more
+  fan). Be clear about what this is: on a card with a static thermal limit
+  it is **not** an independent observable — the measured card's limit is a
+  hard constant 90 °C, so margin is exactly `90 − die_temp`, an affine
+  reparameterization of die temperature, not new information. Its real
+  value is **portability and self-calibration**: one margin curve is
+  correct on any card without knowing that card's limit, which an
+  absolute-temperature curve can never be. That's exactly what a shipped
+  default needs, and no more than that.
+- **Memory junction temperature** (`[signals.mem_temp]`) is unavailable on
+  most consumer cards: on the measured card NVML returns `NotSupported`,
+  `nvidia-smi` reports N/A, and DCGM reported 0 across 6875 samples over 7
+  days (that zero was DCGM's encoding of "unsupported", not a reading). It
+  ships disabled and only works where NVML actually exposes it. The only
+  memory-overtemp signal reachable on consumer silicon is
+  `SW_THERMAL_SLOWDOWN` — which fires on GPU *or* memory over-temp — and
+  that is why the throttle floor below exists.
+- **The throttle floor** (`[signals.throttle]`) raises applied duty to at
+  least `floor_duty` while the GPU reports any configured throttle reason,
+  and holds it for `hold_secs` after the last assertion (anti-flap). It is
+  a safety net, not a routine control path: no thermal throttle bit was
+  ever observed asserting, even at 84 °C with 5 °C of headroom.
+  `sw_power_cap` is deliberately excluded from the default `reasons` —
+  it was measured asserting continuously (0x4) throughout a sustained
+  load and 0x0 at idle, so including it would pin the fans at the floor
+  during every job (the daemon warns if you configure it anyway).
+
+Filtering: every reading passes a plausibility guard (a spurious 0 or an
+absurd value is treated as absent, not smoothed in), then a per-signal
+EWMA (`alpha`, 1.0 = no smoothing; power uses the asymmetric pair). An
+absent signal simply doesn't produce a candidate — it never drags duty
+down and never triggers alarms.
+
+One legacy knob changes meaning: `hysteresis_c` is honored in legacy mode
+but **inert in fusion mode**. Fusion decides in duty space, not
+temperature space, so change suppression degenerates to the
+`min_duty_delta` check (slew limiting via `max_step_per_tick` still
+applies).
 
 ### The alarm ladder
 
@@ -294,11 +373,17 @@ display never flaps:
 |---|---|---|
 | Normal | — | static gradient color (duty-mapped) |
 | Sustained hot | control temp ≥ `sustained_hot_c` continuously for `sustained_after_secs` | slow breathing in the current gradient color |
-| Near limit | within `near_limit_margin_c` of the curve's top temp, **or** duty pinned at 100% | red breathing, stepping through four escalating pulse rates — one step per `escalate_every_secs`, capping at the fastest |
+| Near limit | within `near_limit_margin_c` of the curve's top temp, **or** duty pinned at 100%, **or** (with `[signals]` enabled) thermal margin ≤ `near_limit_margin_c` or active thermal throttling | red breathing, stepping through four escalating pulse rates — one step per `escalate_every_secs`, capping at the fastest |
 | Fault | all sensors lost (fallback duty active) | orange/red runway — deliberately unlike the thermal states |
 
 The current rung is exported as `unifand_led_state`, so your monitoring can
 alert on the same thing your case is showing.
+
+The two signal-driven Near-limit triggers are live whenever `[signals]
+enabled = true` and the hardware exposes them — independent of whether the
+throttle *floor* is enabled. Disabling `[signals.throttle]` turns off the
+duty floor, not the alarm: sustained thermal throttling still drives the
+LEDs to Near-limit.
 
 ## Metrics
 
@@ -313,16 +398,33 @@ alert on the same thing your case is showing.
 | `unifand_hid_errors_total` | `kind=write\|read` | Fan-protocol write/read failures |
 | `unifand_rgb_errors_total` | — | LED write failures (never affect fan control) |
 | `unifand_led_state` | — | Alarm ladder rung: 0 normal, 1 sustained-hot, 2 near-limit, 3 fault |
+| `unifand_signal_value` | `signal`, `unit=celsius\|watts` | Conditioned (smoothed) value of each available input signal |
+| `unifand_signal_candidate_duty_percent` | `signal` | Duty each available signal's curve commands this tick |
+| `unifand_control_signal` | `signal` | One-hot: 1 for the signal driving the applied duty, 0 for the others (all 0 on a floor-only tick) |
+| `unifand_gpu_power_limit_watts` | — | Enforced GPU power limit — join against `unifand_signal_value{signal="gpu_power"}` for percent-of-limit dashboards regardless of curve unit |
+| `unifand_throttle_active` | `reason=sw_thermal\|hw_thermal\|hw_power_brake\|sw_power_cap` | NVML throttle reason currently asserted |
+| `unifand_throttle_floor_active` | — | 1 while the throttle floor is raising applied duty (including its hold window) |
+| `unifand_signal_errors_total` | `signal` (incl. `throttle`) | Real read failures per signal; `NotSupported` is not counted — it means the signal is absent |
 | `unifand_last_tick_timestamp_seconds` | — | Unix time the control loop last completed a tick; backs `/healthz` |
 | `unifand_build_info` | `version` | Always 1; join on `version` to identify the running build |
+
+The fusion families only appear with `[signals] enabled = true` (except
+`unifand_throttle_floor_active`, a plain scalar that always renders and
+reads 0 in legacy mode), and an absent signal emits **no** series (no
+`NaN`, no stale zero) — the
+`unifand_signal_*` and `unifand_control_signal` series are replaced
+wholesale each tick and describe the latest tick only, so a signal that
+goes away disappears from the scrape rather than lingering at its last
+value.
 
 `/healthz` (same port as `/metrics`) returns 200 while `now - unifand_last_tick_timestamp_seconds <= 3 * poll_interval_secs`, else 500 — this is what the DaemonSet's livenessProbe checks, so a wedged control loop (not just an unreachable metrics port) gets restarted.
 
 ### Monitoring
 
 [`contrib/`](contrib/) has a ready-to-import Grafana dashboard, a
-Prometheus/VictoriaMetrics alerting-rules file (six rules covering the
-failure modes above — hub missing, loop stuck, all sensors lost, etc.), and
+Prometheus/VictoriaMetrics alerting-rules file (nine rules covering the
+failure modes above — hub missing, loop stuck, all sensors lost, fans
+stalled, sustained thermal throttling, etc.), and
 scrape examples for prometheus-operator, the VictoriaMetrics operator, and
 plain annotation-based discovery. See [`contrib/README.md`](contrib/README.md).
 
@@ -457,6 +559,12 @@ but we ship one image.
 - arm64: no NVML and no `k10temp` on ARM SoCs, so today the arm64 image
   always runs sensor-less — permanent `fallback_duty` and a Fault LED
   signature (see Troubleshooting). Safe, but not closed-loop.
+- Thermal margin is computed as `temperature_threshold(GpuMax) − die_temp`.
+  NVML's dedicated T.Limit fields (193/194/196) are unreadable through
+  `nvml-wrapper` 0.12.1 — the driver reports a value type the crate's
+  `SampleValue` enum can't decode. A crate limitation, not a hardware one
+  (`nvidia-smi` reads them fine); the computed path is equivalent on
+  static-limit cards.
 - LED animations are used only where they carry meaning (the alarm ladder);
   decorative effects (rainbow, meteor-for-fun) are deliberately out of scope —
   it's a gauge, not a light show.
