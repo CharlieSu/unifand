@@ -1,0 +1,146 @@
+# unifand configuration — multi-signal fusion, tuned starting point
+#
+# Fans follow the highest duty any enabled signal's curve commands
+# (raise-only: a signal can raise duty above what die temp asks for, never
+# lower it). This file is a STARTING POINT, not a drop-in: the curve knees
+# below were measured on one RTX 5090 FE (575 W enforced limit, 90 °C
+# thermal limit) and every card needs its own tuning pass. The gpu_power
+# curve ships in percent_tdp, which is portable — percent of whatever limit
+# your card enforces; the commented watts alternative is NOT portable and
+# must be retuned per card. See README "Multi-signal fusion".
+
+poll_interval_secs = 5
+channels = [1, 2]
+fallback_duty = 60
+cpu_offset = 10.0
+
+# NOTE: hysteresis_c is honored in legacy (signals-disabled) mode only.
+# With fusion enabled it is inert — fusion decides in duty space, so change
+# suppression degenerates to min_duty_delta.
+hysteresis_c = 2.0
+min_duty_delta = 5
+max_step_per_tick = 10
+
+# Top-level curve: still required, and doubles as the die-temp curve for
+# the gpu_temp/cpu_temp signals below (they fall back to it when they have
+# no curve of their own).
+[[curve]]
+temp = 35.0
+duty = 30
+[[curve]]
+temp = 55.0
+duty = 40
+[[curve]]
+temp = 68.0
+duty = 65
+[[curve]]
+temp = 75.0
+duty = 85
+[[curve]]
+temp = 80.0
+duty = 100
+
+[metrics]
+listen = "0.0.0.0:9877"
+
+[signals]
+enabled = true
+
+# Die temperatures: same behavior as the legacy loop (both fall back to the
+# top-level [[curve]]), now competing as candidates alongside the signals
+# below.
+[signals.gpu_temp]
+enabled = true
+
+[signals.cpu_temp]
+enabled = true
+offset_c = 10.0
+
+# Thermal margin: headroom in °C to the card's own thermal limit
+# (limit - die temp). INVERTED curve — small headroom means high duty.
+# Self-calibrating: this exact curve is correct on any card, because it is
+# denominated in distance-to-the-limit rather than absolute degrees.
+# Knees from measured data: 5 °C headroom under sustained load, 39-55 °C
+# at idle.
+[signals.thermal_margin]
+enabled = true
+[[signals.thermal_margin.curve]]
+value = 5
+duty = 100
+[[signals.thermal_margin.curve]]
+value = 10
+duty = 85
+[[signals.thermal_margin.curve]]
+value = 20
+duty = 60
+[[signals.thermal_margin.curve]]
+value = 35
+duty = 30
+
+# GPU power draw: the leading signal — on load release, power sheds ~96% of
+# its range in ~20 s while die temp has shed about half and keeps decaying
+# for 40+ s. The asymmetric filter (rise_alpha/fall_alpha defaults 0.5/0.1)
+# tracks load onset fast and releases slowly so the fans keep clearing the
+# heatsink after power drops.
+#
+# percent_tdp is the PORTABLE unit: curve X is percent of the card's
+# enforced power limit, so the same knees hold across cards. Measured on a
+# 575 W limit: idle ~3%, sustained load ~98%.
+[signals.gpu_power]
+enabled = true
+unit = "percent_tdp"
+[[signals.gpu_power.curve]]
+value = 25
+duty = 30
+[[signals.gpu_power.curve]]
+value = 50
+duty = 55
+[[signals.gpu_power.curve]]
+value = 75
+duty = 75
+[[signals.gpu_power.curve]]
+value = 95
+duty = 100
+
+# Absolute-watts alternative, tuned for a 575 W card (RTX 5090 FE) —
+# requires retuning for any other card. To use it: set unit = "watts"
+# above, delete the percent_tdp curve, and uncomment:
+# [[signals.gpu_power.curve]]
+# value = 120
+# duty = 30
+# [[signals.gpu_power.curve]]
+# value = 300
+# duty = 60
+# [[signals.gpu_power.curve]]
+# value = 450
+# duty = 85
+# [[signals.gpu_power.curve]]
+# value = 560
+# duty = 100
+
+# Throttle duty floor: while the GPU reports any of the listed reasons,
+# applied duty is raised to at least floor_duty, held for hold_secs after
+# the last assertion (anti-flap). A safety net, not a routine path — no
+# thermal throttle bit was ever observed asserting on the measured card,
+# even at 84 °C with 5 °C of headroom. sw_thermal (SW_THERMAL_SLOWDOWN)
+# fires on GPU *or memory* over-temp, which makes this floor the only
+# memory-overtemp response reachable on cards that don't expose a memory
+# temperature (see mem_temp below). Do NOT add "sw_power_cap": it asserts
+# continuously under any sustained load (measured) and would pin fans at
+# the floor for every job.
+[signals.throttle]
+enabled = true
+floor_duty = 85
+hold_secs = 30
+reasons = ["sw_thermal", "hw_thermal", "hw_power_brake"]
+
+# Memory junction temperature: disabled because NVML reports it
+# NotSupported on the measured card (RTX 5090 — nvidia-smi shows N/A too),
+# as on most consumer silicon. Only enable it where
+# unifand_signal_value{signal="mem_temp"} actually reports; until then the
+# throttle floor above is the memory-overtemp path.
+[signals.mem_temp]
+enabled = false
+# [[signals.mem_temp.curve]]
+# temp = 80.0
+# duty = 50

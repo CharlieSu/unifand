@@ -107,3 +107,90 @@ escalate_every_secs = 30
 cooldown_secs = 60
 alert_color = [255, 0, 0]
 fault_colors = [[255, 80, 0], [255, 0, 0]]
+
+# Multi-signal fusion: fans follow the highest duty any enabled signal's
+# curve commands (raise-only — a signal can raise duty above what the die
+# temp asks for, never lower it). Off by default; with this section absent
+# or enabled = false, behavior is exactly the legacy single-curve loop
+# above. See README "Multi-signal fusion" and, for a complete tuned
+# starting point, examples/config-multisignal.toml.
+#
+# Note: with fusion enabled, hysteresis_c above is inert (fusion decides in
+# duty space, so change suppression degenerates to min_duty_delta).
+[signals]
+enabled = false
+
+# GPU die temperature as a fusion signal. With curve omitted it uses the
+# top-level [[curve]] above, so enabling [signals] alone changes nothing
+# about how die temp maps to duty. alpha is EWMA smoothing per tick
+# (1.0 = no smoothing).
+[signals.gpu_temp]
+enabled = true
+alpha = 1.0
+# Own curve (optional; falls back to the top-level [[curve]] when omitted):
+# [[signals.gpu_temp.curve]]
+# temp = 35.0
+# duty = 30
+
+# CPU temperature as a fusion signal. offset_c plays the same role as the
+# top-level cpu_offset (subtracted before the curve lookup); with curve
+# omitted it uses the top-level [[curve]].
+[signals.cpu_temp]
+enabled = true
+offset_c = 10.0
+alpha = 1.0
+
+# GPU power draw. Disabled by default and has no top-level fallback — a
+# curve is required when enabled. unit selects the curve's X axis:
+# "watts" (the default — absolute, tuned to one card) or "percent_tdp"
+# (percent of the enforced power limit — portable across cards).
+# Power rises fast and falls slow through an asymmetric filter: rise_alpha
+# tracks load onset quickly, fall_alpha releases slowly so fans keep
+# moving heat out of the heatsink after the load drops (power sheds ~96%
+# of its range in ~20 s on load release while the die is still hot).
+[signals.gpu_power]
+enabled = false
+unit = "watts"
+rise_alpha = 0.5
+fall_alpha = 0.1
+# [[signals.gpu_power.curve]]
+# value = 120
+# duty = 30
+
+# Thermal margin: headroom in °C to the card's own thermal limit
+# (limit - die temp), so the curve is INVERTED — small headroom means high
+# duty. Self-calibrating across cards: one margin curve is correct on any
+# card without knowing that card's limit. Disabled by default; a curve is
+# required when enabled (values must be strictly increasing headroom).
+[signals.thermal_margin]
+enabled = false
+alpha = 0.4
+# [[signals.thermal_margin.curve]]
+# value = 5
+# duty = 100
+# [[signals.thermal_margin.curve]]
+# value = 35
+# duty = 30
+
+# Memory junction temperature. Disabled by default because NVML does not
+# expose it on most consumer cards (verified NotSupported on an RTX 5090);
+# only enable it where `unifand_signal_value{signal="mem_temp"}` actually
+# reports. A curve is required when enabled.
+[signals.mem_temp]
+enabled = false
+alpha = 1.0
+# [[signals.mem_temp.curve]]
+# temp = 80.0
+# duty = 50
+
+# Throttle duty floor: while the GPU reports any of the listed throttle
+# reasons, applied duty is raised to at least floor_duty, held for
+# hold_secs after the last assertion (anti-flap). A safety net, not a
+# routine path — do NOT add "sw_power_cap" to reasons: it asserts
+# continuously under any sustained load (measured) and would pin fans at
+# the floor for every job.
+[signals.throttle]
+enabled = false
+floor_duty = 85
+hold_secs = 30
+reasons = ["sw_thermal", "hw_thermal", "hw_power_brake"]

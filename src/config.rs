@@ -6,6 +6,11 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct CurvePoint {
+    /// `value` is accepted as an alias so watts/headroom curves under
+    /// `[signals.*]` read naturally (`value = 300`) without renaming this
+    /// field — both keys are known to serde, so `serde_ignored` emits no
+    /// spurious unknown-key warning for either spelling.
+    #[serde(alias = "value")]
     pub temp: f64,
     pub duty: u8,
 }
@@ -108,6 +113,199 @@ impl RgbConfig {
     }
 }
 
+/// Config-facing enum naming a throttle reason, for the set of reasons that
+/// should latch the throttle floor (`[signals.throttle] reasons = [...]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThrottleReason {
+    SwThermal,
+    HwThermal,
+    HwPowerBrake,
+    SwPowerCap,
+}
+
+/// Unit the configured `[signals.gpu_power]` curve's X axis is expressed in.
+/// Default is `watts` — a portable `percent_tdp` default risks silently
+/// reinterpreting a lab-tuned watts curve, so the explicit default favors
+/// the less surprising failure mode (see `validate`'s `percent_tdp` guard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerUnit {
+    #[default]
+    Watts,
+    PercentTdp,
+}
+
+/// GPU die temperature signal. Enabled by default; falls back to the
+/// top-level `[[curve]]` when its own `curve` is left empty (Wave 1
+/// `fuse()`'s contract — see `src/signals.rs`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GpuTempConfig {
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub curve: Vec<CurvePoint>,
+    #[serde(default = "d_signal_alpha_one")]
+    pub alpha: f64,
+}
+
+impl Default for GpuTempConfig {
+    fn default() -> Self {
+        Self {
+            enabled: d_true(),
+            curve: Vec::new(),
+            alpha: d_signal_alpha_one(),
+        }
+    }
+}
+
+/// CPU temperature signal. Enabled by default; `offset_c` reuses the same
+/// default as the legacy top-level `cpu_offset`. Falls back to the
+/// top-level `[[curve]]` when its own `curve` is left empty.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CpuTempConfig {
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub curve: Vec<CurvePoint>,
+    #[serde(default = "d_cpu_offset")]
+    pub offset_c: f64,
+    #[serde(default = "d_signal_alpha_one")]
+    pub alpha: f64,
+}
+
+impl Default for CpuTempConfig {
+    fn default() -> Self {
+        Self {
+            enabled: d_true(),
+            curve: Vec::new(),
+            offset_c: d_cpu_offset(),
+            alpha: d_signal_alpha_one(),
+        }
+    }
+}
+
+/// GPU power signal (`[signals.gpu_power]`). Disabled by default; unlike
+/// gpu_temp/cpu_temp there is no top-level fallback for a watts/percent
+/// curve, so `curve` is required by `validate` when enabled.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GpuPowerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub curve: Vec<CurvePoint>,
+    #[serde(default = "d_power_unit")]
+    pub unit: PowerUnit,
+    #[serde(default = "d_power_rise_alpha")]
+    pub rise_alpha: f64,
+    #[serde(default = "d_power_fall_alpha")]
+    pub fall_alpha: f64,
+}
+
+impl Default for GpuPowerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            curve: Vec::new(),
+            unit: d_power_unit(),
+            rise_alpha: d_power_rise_alpha(),
+            fall_alpha: d_power_fall_alpha(),
+        }
+    }
+}
+
+/// Thermal margin signal (`[signals.thermal_margin]`, headroom-to-limit °C).
+/// Disabled by default; `curve` is required by `validate` when enabled (no
+/// top-level fallback — margin's X axis isn't a die temperature).
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarginConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub curve: Vec<CurvePoint>,
+    #[serde(default = "d_margin_alpha")]
+    pub alpha: f64,
+}
+
+impl Default for MarginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            curve: Vec::new(),
+            alpha: d_margin_alpha(),
+        }
+    }
+}
+
+/// Memory temperature signal (`[signals.mem_temp]`). Disabled by default;
+/// `curve` is required by `validate` when enabled.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemTempConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub curve: Vec<CurvePoint>,
+    #[serde(default = "d_signal_alpha_one")]
+    pub alpha: f64,
+}
+
+impl Default for MemTempConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            curve: Vec::new(),
+            alpha: d_signal_alpha_one(),
+        }
+    }
+}
+
+/// Throttle-reason duty floor (`[signals.throttle]`) — anti-flap safety net,
+/// not a routine control path (Wave 0 hardware data: no thermal throttle bit
+/// ever asserted, even at 84 °C with 5 °C headroom).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThrottleConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "d_throttle_floor_duty")]
+    pub floor_duty: u8,
+    #[serde(default = "d_throttle_hold_secs")]
+    pub hold_secs: u64,
+    #[serde(default = "d_throttle_reasons")]
+    pub reasons: Vec<ThrottleReason>,
+}
+
+impl Default for ThrottleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            floor_duty: d_throttle_floor_duty(),
+            hold_secs: d_throttle_hold_secs(),
+            reasons: d_throttle_reasons(),
+        }
+    }
+}
+
+/// `[signals]` section: multi-signal fan-curve fusion (GPU power, thermal
+/// margin, throttle floor), gated behind `enabled` — inert unless turned on,
+/// mirroring `[rgb]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SignalsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub gpu_temp: GpuTempConfig,
+    #[serde(default)]
+    pub cpu_temp: CpuTempConfig,
+    #[serde(default)]
+    pub gpu_power: GpuPowerConfig,
+    #[serde(default)]
+    pub thermal_margin: MarginConfig,
+    #[serde(default)]
+    pub mem_temp: MemTempConfig,
+    #[serde(default)]
+    pub throttle: ThrottleConfig,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default = "d_poll")]
@@ -130,6 +328,8 @@ pub struct Config {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub rgb: RgbConfig,
+    #[serde(default)]
+    pub signals: SignalsConfig,
 }
 
 fn d_sustained_hot_c() -> f64 {
@@ -193,6 +393,38 @@ fn d_rgb_brightness() -> u8 {
 fn d_rgb_buckets() -> u8 {
     8
 }
+fn d_true() -> bool {
+    true
+}
+fn d_signal_alpha_one() -> f64 {
+    1.0
+}
+fn d_margin_alpha() -> f64 {
+    0.4
+}
+fn d_power_unit() -> PowerUnit {
+    PowerUnit::Watts
+}
+fn d_power_rise_alpha() -> f64 {
+    0.5
+}
+fn d_power_fall_alpha() -> f64 {
+    0.1
+}
+fn d_throttle_floor_duty() -> u8 {
+    85
+}
+fn d_throttle_hold_secs() -> u64 {
+    30
+}
+fn d_throttle_reasons() -> Vec<ThrottleReason> {
+    vec![
+        ThrottleReason::SwThermal,
+        ThrottleReason::HwThermal,
+        ThrottleReason::HwPowerBrake,
+    ]
+}
+
 fn d_rgb_stops() -> Vec<ColorStop> {
     vec![
         ColorStop {
@@ -216,6 +448,28 @@ fn d_rgb_stops() -> Vec<ColorStop> {
             color: [255, 0, 0],
         },
     ]
+}
+
+/// Shared curve validator: non-empty, strictly increasing `temp` (the X
+/// axis — die temp, watts, or headroom depending on the signal), and no
+/// `duty` over 100. `name` prefixes every error message so callers (the
+/// top-level `[[curve]]` and each `[signals.*]` curve) get a distinguishable
+/// message from one implementation.
+fn validate_curve(name: &str, points: &[CurvePoint]) -> Result<()> {
+    if points.is_empty() {
+        bail!("{name} must have at least one point");
+    }
+    for w in points.windows(2) {
+        if w[1].temp <= w[0].temp {
+            bail!("{name} temps must be strictly increasing");
+        }
+    }
+    for p in points {
+        if p.duty > 100 {
+            bail!("{name} duty {} exceeds 100", p.duty);
+        }
+    }
+    Ok(())
 }
 
 impl Config {
@@ -244,6 +498,32 @@ impl Config {
         for path in &ignored {
             log::warn!("ignoring unknown config key: {path}");
         }
+        if cfg.signals.enabled && cfg.signals.thermal_margin.enabled {
+            let duties: Vec<u8> = cfg
+                .signals
+                .thermal_margin
+                .curve
+                .iter()
+                .map(|p| p.duty)
+                .collect();
+            if duties.windows(2).any(|w| w[1] > w[0]) {
+                log::warn!(
+                    "signals.thermal_margin.curve duty rises with headroom; more thermal headroom will command more fan — is the curve inverted?"
+                );
+            }
+        }
+        if cfg.signals.enabled
+            && cfg.signals.throttle.enabled
+            && cfg
+                .signals
+                .throttle
+                .reasons
+                .contains(&ThrottleReason::SwPowerCap)
+        {
+            log::warn!(
+                "signals.throttle.reasons includes sw_power_cap, which MEASURED on this hardware asserts continuously (0x4) throughout a full inference load — including it will hold the throttle floor duty for the entire duration of any sustained load"
+            );
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -255,19 +535,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.curve.is_empty() {
-            bail!("curve must have at least one point");
-        }
-        for w in self.curve.windows(2) {
-            if w[1].temp <= w[0].temp {
-                bail!("curve temps must be strictly increasing");
-            }
-        }
-        for p in &self.curve {
-            if p.duty > 100 {
-                bail!("curve duty {} exceeds 100", p.duty);
-            }
-        }
+        validate_curve("curve", &self.curve)?;
         if self.fallback_duty > 100 {
             bail!("fallback_duty exceeds 100");
         }
@@ -354,6 +622,113 @@ impl Config {
                 }
                 if self.rgb.alerts.near_limit_margin_c < 0.0 {
                     bail!("rgb.alerts.near_limit_margin_c must not be negative");
+                }
+            }
+        }
+        if self.signals.enabled {
+            let s = &self.signals;
+            if !(s.gpu_temp.enabled
+                || s.cpu_temp.enabled
+                || s.gpu_power.enabled
+                || s.thermal_margin.enabled
+                || s.mem_temp.enabled)
+            {
+                bail!("signals.enabled but no sub-signal (gpu_temp/cpu_temp/power/margin/mem_temp) is enabled");
+            }
+
+            // Each sub-signal's checks are gated on that sub-signal's own
+            // `enabled` flag — a disabled sub-signal's leftover/bad values
+            // (stale curve, out-of-range alpha, ...) must not fail
+            // validation, mirroring how `[rgb.alerts]` is only checked when
+            // `rgb.alerts.enabled`.
+            if s.gpu_temp.enabled {
+                if !s.gpu_temp.curve.is_empty() {
+                    validate_curve("signals.gpu_temp.curve", &s.gpu_temp.curve)?;
+                }
+                if !(s.gpu_temp.alpha > 0.0 && s.gpu_temp.alpha <= 1.0) {
+                    bail!(
+                        "signals.gpu_temp.alpha {} must be in (0.0, 1.0]",
+                        s.gpu_temp.alpha
+                    );
+                }
+            }
+
+            if s.cpu_temp.enabled {
+                if !s.cpu_temp.curve.is_empty() {
+                    validate_curve("signals.cpu_temp.curve", &s.cpu_temp.curve)?;
+                }
+                if !(s.cpu_temp.alpha > 0.0 && s.cpu_temp.alpha <= 1.0) {
+                    bail!(
+                        "signals.cpu_temp.alpha {} must be in (0.0, 1.0]",
+                        s.cpu_temp.alpha
+                    );
+                }
+                if s.cpu_temp.offset_c < 0.0 {
+                    bail!("signals.cpu_temp.offset_c must not be negative");
+                }
+            }
+
+            // power/margin/mem_temp have no top-level curve fallback (their
+            // X axes aren't die temperature), so an empty curve is always a
+            // bail when the sub-signal is enabled, not a silent no-op.
+            if s.gpu_power.enabled {
+                validate_curve("signals.gpu_power.curve", &s.gpu_power.curve)?;
+                if !(s.gpu_power.rise_alpha > 0.0 && s.gpu_power.rise_alpha <= 1.0) {
+                    bail!(
+                        "signals.gpu_power.rise_alpha {} must be in (0.0, 1.0]",
+                        s.gpu_power.rise_alpha
+                    );
+                }
+                if !(s.gpu_power.fall_alpha > 0.0 && s.gpu_power.fall_alpha <= 1.0) {
+                    bail!(
+                        "signals.gpu_power.fall_alpha {} must be in (0.0, 1.0]",
+                        s.gpu_power.fall_alpha
+                    );
+                }
+                if s.gpu_power.unit == PowerUnit::PercentTdp
+                    && s.gpu_power.curve.iter().any(|p| p.temp > 200.0)
+                {
+                    bail!(
+                        "signals.gpu_power.curve has a point > 200 with unit = \"percent_tdp\" — likely a watts/percent mixup"
+                    );
+                }
+            }
+
+            if s.thermal_margin.enabled {
+                validate_curve("signals.thermal_margin.curve", &s.thermal_margin.curve)?;
+                if !(s.thermal_margin.alpha > 0.0 && s.thermal_margin.alpha <= 1.0) {
+                    bail!(
+                        "signals.thermal_margin.alpha {} must be in (0.0, 1.0]",
+                        s.thermal_margin.alpha
+                    );
+                }
+            }
+
+            if s.mem_temp.enabled {
+                validate_curve("signals.mem_temp.curve", &s.mem_temp.curve)?;
+                if !(s.mem_temp.alpha > 0.0 && s.mem_temp.alpha <= 1.0) {
+                    bail!(
+                        "signals.mem_temp.alpha {} must be in (0.0, 1.0]",
+                        s.mem_temp.alpha
+                    );
+                }
+            }
+
+            if s.throttle.enabled {
+                if s.throttle.floor_duty > 100 {
+                    bail!(
+                        "signals.throttle.floor_duty {} exceeds 100",
+                        s.throttle.floor_duty
+                    );
+                }
+                if s.throttle.reasons.is_empty() {
+                    bail!("signals.throttle.reasons must not be empty when throttle is enabled");
+                }
+                if s.throttle.hold_secs > 3600 {
+                    bail!(
+                        "signals.throttle.hold_secs {} exceeds 3600",
+                        s.throttle.hold_secs
+                    );
                 }
             }
         }
@@ -636,5 +1011,249 @@ fans_per_channel = 6
     fn well_formed_config_has_no_ignored_keys() {
         let (_, ignored) = Config::parse_with_ignored(FULL).unwrap();
         assert!(ignored.is_empty(), "{ignored:?}");
+    }
+
+    // -- [signals] -----------------------------------------------------------
+
+    #[test]
+    fn signals_defaults_off_and_sane() {
+        let c = Config::from_str("[[curve]]\ntemp = 40.0\nduty = 50\n").unwrap();
+        assert!(!c.signals.enabled);
+
+        assert!(c.signals.gpu_temp.enabled);
+        assert!(c.signals.gpu_temp.curve.is_empty());
+        assert_eq!(c.signals.gpu_temp.alpha, 1.0);
+
+        assert!(c.signals.cpu_temp.enabled);
+        assert_eq!(c.signals.cpu_temp.offset_c, 10.0);
+        assert_eq!(c.signals.cpu_temp.alpha, 1.0);
+
+        assert!(!c.signals.gpu_power.enabled);
+        assert_eq!(c.signals.gpu_power.unit, PowerUnit::Watts);
+        assert_eq!(c.signals.gpu_power.rise_alpha, 0.5);
+        assert_eq!(c.signals.gpu_power.fall_alpha, 0.1);
+
+        assert!(!c.signals.thermal_margin.enabled);
+        assert_eq!(c.signals.thermal_margin.alpha, 0.4);
+
+        assert!(!c.signals.mem_temp.enabled);
+        assert_eq!(c.signals.mem_temp.alpha, 1.0);
+
+        assert!(!c.signals.throttle.enabled);
+        assert_eq!(c.signals.throttle.floor_duty, 85);
+        assert_eq!(c.signals.throttle.hold_secs, 30);
+        assert_eq!(
+            c.signals.throttle.reasons,
+            vec![
+                ThrottleReason::SwThermal,
+                ThrottleReason::HwThermal,
+                ThrottleReason::HwPowerBrake,
+            ]
+        );
+    }
+
+    #[test]
+    fn signals_section_parses() {
+        let s = r#"
+[[curve]]
+temp = 40.0
+duty = 50
+
+[signals]
+enabled = true
+
+[signals.gpu_temp]
+enabled = true
+
+[signals.cpu_temp]
+enabled = false
+offset_c = 12.0
+
+[signals.gpu_power]
+enabled = true
+unit = "percent_tdp"
+[[signals.gpu_power.curve]]
+temp = 25.0
+duty = 30
+[[signals.gpu_power.curve]]
+temp = 95.0
+duty = 100
+
+[signals.thermal_margin]
+enabled = true
+[[signals.thermal_margin.curve]]
+temp = 5.0
+duty = 100
+[[signals.thermal_margin.curve]]
+temp = 35.0
+duty = 30
+
+[signals.mem_temp]
+enabled = true
+[[signals.mem_temp.curve]]
+temp = 60.0
+duty = 40
+[[signals.mem_temp.curve]]
+temp = 90.0
+duty = 100
+
+[signals.throttle]
+enabled = true
+floor_duty = 90
+hold_secs = 45
+reasons = ["sw_thermal", "hw_power_brake"]
+"#;
+        let c = Config::from_str(s).unwrap();
+        assert!(c.signals.enabled);
+        assert!(c.signals.gpu_temp.enabled);
+        assert!(!c.signals.cpu_temp.enabled);
+        assert_eq!(c.signals.cpu_temp.offset_c, 12.0);
+        assert!(c.signals.gpu_power.enabled);
+        assert_eq!(c.signals.gpu_power.unit, PowerUnit::PercentTdp);
+        assert_eq!(c.signals.gpu_power.curve.len(), 2);
+        assert!(c.signals.thermal_margin.enabled);
+        assert_eq!(c.signals.thermal_margin.curve.len(), 2);
+        assert!(c.signals.mem_temp.enabled);
+        assert!(c.signals.throttle.enabled);
+        assert_eq!(c.signals.throttle.floor_duty, 90);
+        assert_eq!(c.signals.throttle.hold_secs, 45);
+        assert_eq!(
+            c.signals.throttle.reasons,
+            vec![ThrottleReason::SwThermal, ThrottleReason::HwPowerBrake]
+        );
+    }
+
+    #[test]
+    fn curve_point_accepts_value_alias() {
+        let s = r#"
+[[curve]]
+temp = 40.0
+duty = 50
+[signals]
+enabled = true
+[signals.gpu_power]
+enabled = true
+unit = "watts"
+[[signals.gpu_power.curve]]
+value = 120.0
+duty = 30
+[[signals.gpu_power.curve]]
+value = 560.0
+duty = 100
+"#;
+        let c = Config::from_str(s).unwrap();
+        assert_eq!(c.signals.gpu_power.curve[0].temp, 120.0);
+        assert_eq!(c.signals.gpu_power.curve[1].temp, 560.0);
+
+        // `value` must be a serde ALIAS, not a rename: an alias is a known key,
+        // so it must not surface as an unknown-key warning. If this ever
+        // regressed to `rename`, `temp` would break elsewhere and `value` would
+        // start warning -- neither of which the assertions above would catch,
+        // since from_str only logs unknown keys rather than failing.
+        let (_, ignored) = Config::parse_with_ignored(s).unwrap();
+        assert!(
+            ignored.is_empty(),
+            "`value` alias must not be reported as an unknown key, got {ignored:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_mem_temp_enabled_without_curve() {
+        // Same contract as power/margin: no top-level fallback exists for a
+        // memory-temperature curve, so enabling the signal without one is a
+        // config error rather than a silently inert signal.
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.mem_temp]\nenabled = true\n";
+        assert!(Config::from_str(s).is_err());
+    }
+
+    #[test]
+    fn rejects_signals_enabled_with_no_signal_enabled() {
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.gpu_temp]\nenabled = false\n[signals.cpu_temp]\nenabled = false\n";
+        assert!(Config::from_str(s).is_err());
+    }
+
+    #[test]
+    fn rejects_power_enabled_without_curve() {
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.gpu_power]\nenabled = true\n";
+        assert!(Config::from_str(s).is_err());
+    }
+
+    #[test]
+    fn rejects_margin_enabled_without_curve() {
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.thermal_margin]\nenabled = true\n";
+        assert!(Config::from_str(s).is_err());
+    }
+
+    #[test]
+    fn rejects_alpha_out_of_range() {
+        let base = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.gpu_temp]\nenabled = true\n";
+        for bad in ["0.0", "-0.1", "1.5"] {
+            let s = format!("{base}alpha = {bad}\n");
+            assert!(
+                Config::from_str(&s).is_err(),
+                "alpha={bad} should be rejected"
+            );
+        }
+        let ok = format!("{base}alpha = 1.0\n");
+        assert!(Config::from_str(&ok).is_ok());
+    }
+
+    #[test]
+    fn rejects_percent_tdp_curve_over_200() {
+        let s = r#"
+[[curve]]
+temp = 40.0
+duty = 50
+[signals]
+enabled = true
+[signals.gpu_power]
+enabled = true
+unit = "percent_tdp"
+[[signals.gpu_power.curve]]
+temp = 120.0
+duty = 30
+[[signals.gpu_power.curve]]
+temp = 560.0
+duty = 100
+"#;
+        assert!(Config::from_str(s).is_err());
+    }
+
+    #[test]
+    fn rejects_throttle_floor_over_100() {
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.throttle]\nenabled = true\nfloor_duty = 101\n";
+        assert!(Config::from_str(s).is_err());
+    }
+
+    #[test]
+    fn rejects_negative_signals_cpu_offset() {
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.cpu_temp]\nenabled = true\noffset_c = -1.0\n";
+        assert!(Config::from_str(s).is_err());
+    }
+
+    #[test]
+    fn signals_bad_values_ignored_when_disabled() {
+        // disabled section skips signals validation entirely
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = false\n[signals.throttle]\nenabled = true\nfloor_duty = 200\n";
+        assert!(Config::from_str(s).is_ok());
+    }
+
+    #[test]
+    fn signals_sub_signal_bad_values_ignored_when_sub_signal_disabled() {
+        // gpu_temp stays enabled (its default), so signals.enabled has a
+        // live sub-signal; cpu_temp's out-of-range values must be ignored
+        // because cpu_temp itself is disabled.
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.cpu_temp]\nenabled = false\noffset_c = -5.0\nalpha = 5.0\n";
+        assert!(Config::from_str(s).is_ok());
+    }
+
+    #[test]
+    fn unknown_signals_key_is_collected_with_dotted_path() {
+        let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\ntypo_field = 1\n";
+        let (_, ignored) = Config::parse_with_ignored(s).unwrap();
+        assert!(
+            ignored.iter().any(|p| p == "signals.typo_field"),
+            "{ignored:?}"
+        );
     }
 }

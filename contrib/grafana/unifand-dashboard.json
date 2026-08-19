@@ -745,6 +745,274 @@
         }
       ],
       "description": "LED writes are cosmetic-only and never affect fan control (see README)."
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Signal Candidate Duty (by signal)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "spanNulls": false
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "unifand_signal_candidate_duty_percent",
+          "refId": "A",
+          "legendFormat": "{{signal}}"
+        }
+      ],
+      "description": "Multi-signal fusion ([signals] enabled): the duty each available signal's curve commands this tick. The highest line is the fused target (before slew limiting and the throttle floor) \u2014 this overlay shows which signal is winning and by how much. Absent signals emit no series."
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Signal In Control (one-hot)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "unifand_control_signal",
+          "refId": "A",
+          "legendFormat": "{{signal}}"
+        }
+      ],
+      "description": "1 for the signal driving the applied duty, 0 for other available signals. All 0 on a floor-only tick (the throttle floor, not a curve, set the duty). Watch this hand off from gpu_temp to gpu_power on load onset."
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "GPU Power vs Enforced Limit",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "spanNulls": false
+          },
+          "unit": "watt"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "unifand_signal_value{signal=\"gpu_power\"}",
+          "refId": "A",
+          "legendFormat": "power (conditioned)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "unifand_gpu_power_limit_watts",
+          "refId": "B",
+          "legendFormat": "enforced limit"
+        }
+      ],
+      "description": "Conditioned (asymmetric-EWMA) power draw against the enforced power limit unifand uses to scale a percent_tdp curve. The conditioned value falls slower than raw power on load release by design (slow-release filter)."
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Throttle State (by reason)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 42,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "unifand_throttle_active",
+          "refId": "A",
+          "legendFormat": "{{reason}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "unifand_throttle_floor_active",
+          "refId": "B",
+          "legendFormat": "floor active"
+        }
+      ],
+      "description": "NVML throttle-reason bits plus the throttle duty floor (including its hold window). sw_power_cap asserting throughout a sustained load is NORMAL (measured) and is excluded from the default floor reasons; sw_thermal/hw_thermal/hw_power_brake asserting is not."
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Signal Error Rate (by signal)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 50,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "spanNulls": false
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(unifand_signal_errors_total[5m])",
+          "refId": "A",
+          "legendFormat": "{{signal}}"
+        }
+      ],
+      "description": "Real per-signal read failures (NotSupported is not counted \u2014 it means the signal is absent, which is normal). A sustained nonzero rate means a sensor that should work is failing repeatedly. The 'throttle' series covers the throttle-reason read that feeds the floor and the alarm ladder."
     }
   ]
 }

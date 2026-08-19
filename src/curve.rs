@@ -48,16 +48,46 @@ impl Controller {
 
     pub fn decide(&mut self, curve: &[CurvePoint], temp: f64) -> Option<u8> {
         let target = interpolate(curve, temp);
+        self.step_toward(target, Some(temp))
+    }
+
+    /// Drives the controller straight off a fused duty target (e.g. from
+    /// `signals::fuse`) instead of a temperature/curve lookup. `temp: None`
+    /// means `step_toward`'s `temp_moved` gate is always false and
+    /// `last_temp` is never read or written, so the hysteresis hold
+    /// degenerates to a pure `duty_gap >= min_duty_delta` check in duty
+    /// space.
+    pub fn decide_target(&mut self, target: u8) -> Option<u8> {
+        self.step_toward(target, None)
+    }
+
+    /// Today's `decide` control flow, extracted verbatim: hysteresis hold,
+    /// slew limiting, and their two asymmetric early returns. `temp: Some`
+    /// enables the hysteresis "hold if neither temp nor duty moved enough"
+    /// gate and updates `last_temp` on every path that doesn't hold; `temp:
+    /// None` disables the temp-moved gate entirely (see `decide_target`)
+    /// and never touches `last_temp`.
+    ///
+    /// LOAD-BEARING ASYMMETRY (pinned by the 10 pre-existing curve tests):
+    /// the hysteresis hold returns `None` WITHOUT updating `last_temp`,
+    /// while the `duty_gap == 0` branch DOES update `last_temp` before
+    /// returning `None`.
+    fn step_toward(&mut self, target: u8, temp: Option<f64>) -> Option<u8> {
         let next = match self.last_duty {
             None => target,
             Some(last) => {
-                let temp_moved = (temp - self.last_temp).abs() >= self.hysteresis_c;
+                let temp_moved = match temp {
+                    Some(t) => (t - self.last_temp).abs() >= self.hysteresis_c,
+                    None => false,
+                };
                 let duty_gap = target.abs_diff(last);
                 if !temp_moved && duty_gap < self.min_duty_delta {
                     return None;
                 }
                 if duty_gap == 0 {
-                    self.last_temp = temp;
+                    if let Some(t) = temp {
+                        self.last_temp = t;
+                    }
                     return None;
                 }
                 let step = duty_gap.min(self.max_step);
@@ -69,7 +99,9 @@ impl Controller {
             }
         };
         self.last_duty = Some(next);
-        self.last_temp = temp;
+        if let Some(t) = temp {
+            self.last_temp = t;
+        }
         Some(next)
     }
 }
@@ -166,5 +198,70 @@ mod tests {
         ctl.force(60);
         // target 35 at 45C; from 60 slew-limited to 50
         assert_eq!(ctl.decide(&c(), 45.0), Some(50));
+    }
+
+    // -- decide_target / step_toward ---------------------------------------
+
+    #[test]
+    fn decide_target_first_call_applies_directly() {
+        let mut ctl = Controller::new(2.0, 5, 10);
+        assert_eq!(ctl.decide_target(35), Some(35));
+    }
+
+    #[test]
+    fn decide_target_holds_within_min_duty_delta() {
+        let mut ctl = Controller::new(2.0, 5, 10);
+        ctl.decide_target(35);
+        // duty_gap = |38-35| = 3 < min_duty_delta(5), and temp_moved is
+        // always false when temp is None: hold.
+        assert_eq!(ctl.decide_target(38), None);
+    }
+
+    #[test]
+    fn decide_target_is_slew_limited() {
+        let mut ctl = Controller::new(2.0, 5, 10);
+        ctl.decide_target(35);
+        assert_eq!(ctl.decide_target(100), Some(45));
+        assert_eq!(ctl.decide_target(100), Some(55));
+    }
+
+    #[test]
+    fn decide_target_duty_gap_zero_does_not_touch_last_temp() {
+        // With any positive min_duty_delta, duty_gap == 0 always satisfies
+        // `duty_gap < min_duty_delta` (since temp_moved is unconditionally
+        // false when temp is None), so the FIRST early return (hysteresis
+        // hold) always intercepts before the second (`duty_gap == 0`)
+        // branch is ever reached. min_duty_delta 0 is required to reach it:
+        // duty_gap (unsigned) can never be < 0.
+        let mut ctl = Controller::new(2.0, 0, 10);
+        assert_eq!(ctl.decide_target(35), Some(35));
+        // Same target again: duty_gap == 0, falls through the first branch
+        // (0 < 0 is false) and hits the second -- must return None WITHOUT
+        // assigning last_temp, since temp is None throughout decide_target.
+        assert_eq!(ctl.decide_target(35), None);
+        assert!(
+            ctl.last_temp.is_nan(),
+            "decide_target must never assign last_temp; got {}",
+            ctl.last_temp
+        );
+    }
+
+    #[test]
+    fn decide_and_decide_target_agree_on_the_same_curve_target() {
+        // Interleave decide() and decide_target() on the same controller to
+        // prove the step_toward extraction didn't alter the temp-driven
+        // path: decide_target() must not read or write last_temp, so a
+        // subsequent decide() call must behave exactly as if the
+        // decide_target() call had never happened.
+        let mut ctl = Controller::new(2.0, 5, 10);
+        assert_eq!(ctl.decide(&c(), 45.0), Some(35)); // last_duty=35, last_temp=45
+
+        let target = interpolate(&c(), 80.0); // 100
+        assert_eq!(ctl.decide_target(target), Some(45)); // slew-limited 35->45; last_temp untouched
+
+        // last_temp is still 45.0 here (35 apart from 80 -> temp_moved),
+        // and last_duty is 45: duty_gap to target 100 is 55, slew-capped
+        // at 10 -> 55.
+        assert_eq!(ctl.decide(&c(), 80.0), Some(55));
     }
 }
