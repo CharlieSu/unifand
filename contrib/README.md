@@ -29,6 +29,26 @@ empty on a daemon running with `[signals]` disabled — those series aren't
 emitted at all. It carries an `__inputs` block for a
 `${DS_PROMETHEUS}` datasource variable, so Grafana's import flow will prompt
 you to pick a datasource rather than assuming a "default" one exists.
+
+Every panel aggregates `by (node, ...)` rather than querying the raw series.
+unifand is a DaemonSet, so without that a pod restart splits every series in
+two: the graphs grow duplicate legend entries and disjoint segments with gaps,
+and each single-value panel sprouts an extra box per pod in the time window.
+Aggregating collapses that churn into one continuous series per node.
+
+For the `node` grouping to mean anything, your scrape has to attach a node
+label — with the Prometheus or VictoriaMetrics operators that is one relabel
+rule on the pod scrape:
+
+```yaml
+relabelConfigs:
+  - sourceLabels: [__meta_kubernetes_pod_node_name]
+    targetLabel: node
+```
+
+Without it the dashboard still works and still de-duplicates pod churn; the
+`by (node)` clause just collapses to a single empty-node group, which merges
+nodes together if you run unifand on more than one.
 Works against Prometheus, VictoriaMetrics (its Grafana datasource plugin
 identifies as type `prometheus`), Thanos, or Mimir.
 
