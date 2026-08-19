@@ -5,6 +5,7 @@ mod hid;
 mod metrics;
 mod rgb;
 mod sensors;
+mod signals;
 
 use alarm::{AlarmInputs, AlarmMachine, LedCommand};
 use anyhow::Result;
