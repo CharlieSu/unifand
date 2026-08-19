@@ -5,6 +5,10 @@ edition = "2021"
 rust-version = "1.97"
 license = "MIT"
 description = "GPU-led fan-curve daemon for the Lian Li UNI HUB SL V2"
+repository = "https://github.com/CharlieSu/unifand"
+homepage = "https://github.com/CharlieSu/unifand"
+keywords = ["fan-control", "kubernetes", "lian-li", "thermal", "homelab"]
+categories = ["hardware-support"]
 
 [dependencies]
 anyhow = "1"

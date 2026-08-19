@@ -17,13 +17,15 @@ with the pre-1.0 caveat that minor version bumps may carry breaking changes
 * **deps:** update rust crate signal-hook to 0.4 ([#3](https://github.com/CharlieSu/unifand/issues/3)) ([800dced](https://github.com/CharlieSu/unifand/commit/800dced9a6e8c1d7266c81ce02f752bb88a2a747))
 * **deps:** update rust crate toml to v1 ([#11](https://github.com/CharlieSu/unifand/issues/11)) ([91a7398](https://github.com/CharlieSu/unifand/commit/91a73985557056991796c1a68363dbc612fb074d))
 
-## [0.5.0](https://github.com/CharlieSu/unifand/compare/v0.4.0...v0.5.0) (2026-08-18)
+## [0.5.0] (2026-08-18)
 
 
 ### Features
 
 * **contrib:** fan-stall alert rule ([6dc0518](https://github.com/CharlieSu/unifand/commit/6dc051873375ba13e16b1b0b6439c86036b9b494))
 
+<!-- Sections below predate this repository's public history baseline;
+     their tags/commits are not published, so version headers are unlinked. -->
 ## [0.4.0] - 2026-08-18
 
 A hardening release: closes the observability/liveness gap found by an
@@ -198,10 +200,3 @@ Initial release: the core fan-control daemon.
 - TOML config with defaults and validation.
 - Multi-stage container build.
 
-[0.4.0]: https://github.com/CharlieSu/unifand/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/CharlieSu/unifand/compare/v0.2.2...v0.3.0
-[0.2.2]: https://github.com/CharlieSu/unifand/compare/v0.2.1...v0.2.2
-[0.2.1]: https://github.com/CharlieSu/unifand/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/CharlieSu/unifand/compare/v0.1.1...v0.2.0
-[0.1.1]: https://github.com/CharlieSu/unifand/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/CharlieSu/unifand/releases/tag/v0.1.0
