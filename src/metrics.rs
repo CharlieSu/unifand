@@ -544,6 +544,26 @@ mod tests {
         m.set_degraded(false);
         m.set_led_state(0);
         let out = m.render();
-        assert!(!out.contains("unifand_signal_"));
+        // Cover every new family, not just the `unifand_signal_` prefix: three
+        // of them (control_signal, gpu_power_limit_watts, throttle_active)
+        // don't share it, so a prefix-only check would let an unconditionally
+        // rendered one slip past a test whose name promises otherwise.
+        for family in [
+            "unifand_signal_value",
+            "unifand_signal_candidate_duty_percent",
+            "unifand_signal_errors_total",
+            "unifand_control_signal",
+            "unifand_gpu_power_limit_watts",
+            "unifand_throttle_active",
+        ] {
+            assert!(
+                !out.contains(family),
+                "legacy render must not emit {family}, got:\n{out}"
+            );
+        }
+        // The one sanctioned addition: a single always-present scalar. Pinned
+        // here so "strictly additive plus this one line" stays a deliberate,
+        // reviewed choice rather than drift.
+        assert!(out.contains("unifand_throttle_floor_active 0"));
     }
 }
