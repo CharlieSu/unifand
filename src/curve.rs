@@ -57,10 +57,6 @@ impl Controller {
     /// `last_temp` is never read or written, so the hysteresis hold
     /// degenerates to a pure `duty_gap >= min_duty_delta` check in duty
     /// space.
-    ///
-    /// Not yet wired into the control loop (Wave 7 does that; only this
-    /// module's own tests call it so far), hence `allow(dead_code)`.
-    #[allow(dead_code)]
     pub fn decide_target(&mut self, target: u8) -> Option<u8> {
         self.step_toward(target, None)
     }

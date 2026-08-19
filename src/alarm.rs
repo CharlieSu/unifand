@@ -122,6 +122,13 @@ impl AlarmMachine {
     /// Unchanged signature/behavior: delegates to `tick_with` with
     /// all-absent thermal hints, so every pre-existing caller (and the 8
     /// pre-existing tests) sees exactly the legacy trigger set.
+    ///
+    /// `main.rs` calls `tick_with` directly (it always has real, if
+    /// possibly-default, hints to pass); this stays as the documented
+    /// default-hints convenience API and is exercised by the pre-existing
+    /// test suite (`tick_matches_tick_with_default_hints` pins the
+    /// equivalence), hence the narrow `allow(dead_code)`.
+    #[allow(dead_code)]
     pub fn tick(&mut self, inputs: &AlarmInputs, elapsed: u64) -> Option<&'static str> {
         self.tick_with(inputs, &ThermalHints::default(), elapsed)
     }

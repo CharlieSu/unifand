@@ -35,23 +35,19 @@ pub fn should_reprobe(missing_or_failing: bool, ticks_since_probe: u32, interval
 
 /// Where `GpuSensor::probe_caps` sourced (or failed to source) the thermal
 /// margin signal.
-///
-/// Not yet wired into the control loop (Wave 7 does that; `probe_caps`
-/// currently has no caller outside its own tests), hence `allow(dead_code)`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum MarginSource {
     #[default]
     Unavailable,
     /// Dead on nvml-wrapper 0.12.1, BY DESIGN, and expected to STAY dead
-    /// even after Wave 7 wires the rest of this module in: NVML fields
+    /// even now that the rest of this module is wired in: NVML fields
     /// 193/194/196 report driver value type 5, which this crate version's
     /// `SampleValue` enum (types 0-4 only) cannot decode, so every read
     /// comes back `Err(UnexpectedVariant(5))` (see
     /// `docs/superpowers/plans/wave-0-findings.md`, DEFINITIVE section).
     /// Kept for a future crate version that can decode type 5;
     /// `probe_caps` must never select it. Do not read this as an
-    /// oversight if it's still flagged dead post-Wave-7.
+    /// oversight if it's still flagged dead.
     #[allow(dead_code)]
     TlimitField,
     GpuMaxMinusTemp {
@@ -61,10 +57,6 @@ pub enum MarginSource {
 
 /// GPU multi-signal capabilities detected once by `GpuSensor::probe_caps`,
 /// at init and on re-discovery, rather than re-probed every tick.
-///
-/// Not yet wired into the control loop (Wave 7 does that), hence
-/// `allow(dead_code)`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct GpuCaps {
     pub power: bool,
@@ -77,10 +69,6 @@ pub struct GpuCaps {
 /// True only for a REAL read failure (anything other than `NotSupported`)
 /// on the corresponding signal, for the current tick. `NotSupported` is
 /// normal absence, not an error, and never sets these.
-///
-/// Not yet wired into the control loop (Wave 7 does that), hence
-/// `allow(dead_code)`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SignalErrors {
     pub power: bool,
@@ -93,20 +81,12 @@ pub struct SignalErrors {
 /// limit (~5 min at the default 5 s poll interval). `nvidia-smi -pl` can
 /// change the limit at runtime; reuses the existing `should_reprobe` cadence
 /// helper rather than adding a parallel mechanism.
-///
-/// Not yet wired into the control loop (Wave 7 does that), hence
-/// `allow(dead_code)`.
-#[allow(dead_code)]
 pub const POWER_LIMIT_REFRESH_TICKS: u32 = 60;
 
 /// Shared error policy for every NVML signal read: `NotSupported` is normal
 /// absence for silicon that lacks the signal (never logged per-tick, never
 /// counted as an error); any other error is a real failure (`log::debug!`
 /// plus the error flag).
-///
-/// Only called from `read_signals`, which isn't itself wired into the
-/// control loop yet (Wave 7 does that), hence `allow(dead_code)`.
-#[allow(dead_code)]
 fn classify_read<T>(result: std::result::Result<T, NvmlError>, error_flag: &mut bool) -> Option<T> {
     match result {
         Ok(v) => Some(v),
@@ -123,10 +103,8 @@ fn classify_read<T>(result: std::result::Result<T, NvmlError>, error_flag: &mut 
 /// static GpuMax threshold. Extracted so it's testable without a GPU.
 /// `None` temp (absent or a real read failure) propagates to `None`.
 ///
-/// Exercised directly by `margin_from_threshold_computes_headroom`, but
-/// that's `#[cfg(test)]`-only from the bin target's perspective; not yet
-/// wired into the control loop (Wave 7 does that), hence `allow(dead_code)`.
-#[allow(dead_code)]
+/// Exercised directly by `margin_from_threshold_computes_headroom` as well
+/// as by `read_signals`.
 pub fn margin_from_threshold(threshold_c: f64, temp_c: Option<f64>) -> Option<f64> {
     temp_c.map(|t| threshold_c - t)
 }
@@ -134,10 +112,6 @@ pub fn margin_from_threshold(threshold_c: f64, temp_c: Option<f64>) -> Option<f6
 /// Maps the four throttle-reason bits this daemon tracks for fan control
 /// into `ThrottleFlags`. Reasons not tracked here (e.g. `GPU_IDLE`,
 /// `SYNC_BOOST`) must never leak into a tracked flag.
-///
-/// Exercised directly by tests, but not yet wired into the control loop
-/// (Wave 7 does that), hence `allow(dead_code)`.
-#[allow(dead_code)]
 pub fn throttle_flags(r: ThrottleReasons) -> ThrottleFlags {
     ThrottleFlags {
         sw_thermal: r.contains(ThrottleReasons::SW_THERMAL_SLOWDOWN),
@@ -149,10 +123,6 @@ pub fn throttle_flags(r: ThrottleReasons) -> ThrottleFlags {
 
 /// Extracts the numeric payload from any `SampleValue` variant, handling all
 /// four (including a negative `I64`).
-///
-/// Exercised directly by tests, but not yet wired into the control loop
-/// (Wave 7 does that), hence `allow(dead_code)`.
-#[allow(dead_code)]
 pub fn sample_to_f64(v: SampleValue) -> f64 {
     match v {
         SampleValue::F64(f) => f,
@@ -231,10 +201,6 @@ impl GpuSensor {
     /// but `probe_caps` must never select it. Instead we use
     /// `temperature_threshold(GpuMax) - temperature(Gpu)`, which the Wave 0
     /// spike confirmed returns a clean, stable value (`Ok(90)` on this card).
-    ///
-    /// Not yet wired into the control loop (Wave 7 does that), hence
-    /// `allow(dead_code)`.
-    #[allow(dead_code)]
     pub fn probe_caps(&self) -> GpuCaps {
         let dev = match self.nvml.device_by_index(0) {
             Ok(d) => d,
@@ -282,10 +248,6 @@ impl GpuSensor {
     /// panics — every individual NVML failure is folded into `SignalErrors`
     /// (real failures) or silent absence (`NotSupported`, the normal answer
     /// for silicon that lacks a signal) via `classify_read`.
-    ///
-    /// Not yet wired into the control loop (Wave 7 does that), hence
-    /// `allow(dead_code)`.
-    #[allow(dead_code)]
     pub fn read_signals(&self, caps: &GpuCaps) -> (SignalReadings, SignalErrors) {
         let mut readings = SignalReadings::default();
         let mut errors = SignalErrors::default();
@@ -342,10 +304,6 @@ impl GpuSensor {
     /// stale cached value would silently rescale a `percent_tdp` curve.
     /// Called on the `POWER_LIMIT_REFRESH_TICKS` cadence via the existing
     /// `should_reprobe` helper, not a parallel mechanism.
-    ///
-    /// Not yet wired into the control loop (Wave 7 does that), hence
-    /// `allow(dead_code)`.
-    #[allow(dead_code)]
     pub fn refresh_power_limit(&self, caps: &mut GpuCaps) {
         let dev = match self.nvml.device_by_index(0) {
             Ok(d) => d,

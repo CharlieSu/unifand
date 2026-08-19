@@ -7,14 +7,16 @@ mod rgb;
 mod sensors;
 mod signals;
 
-use alarm::{AlarmInputs, AlarmMachine, LedCommand};
+use alarm::{AlarmInputs, AlarmMachine, LedCommand, ThermalHints};
 use anyhow::Result;
 use config::{Config, RgbConfig};
 use curve::Controller;
 use metrics::now_unix_secs;
 use sensors::{
-    control_temp, format_probe, should_reprobe, CpuSensor, GpuSensor, REDISCOVERY_INTERVAL_TICKS,
+    control_temp, format_probe, should_reprobe, CpuSensor, GpuCaps, GpuSensor, MarginSource,
+    POWER_LIMIT_REFRESH_TICKS, REDISCOVERY_INTERVAL_TICKS,
 };
+use signals::{fuse, SignalConditioner, SignalKind, SignalReadings, ThrottleLatch};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,6 +36,72 @@ struct TempReadings {
     /// (tracked by the caller via `.is_none()`) driving re-discovery.
     gpu_read_failed: bool,
     cpu_read_failed: bool,
+}
+
+/// Persistent state for the multi-signal fusion path, constructed once (only
+/// when `cfg.signals.enabled`) before the control loop starts, and threaded
+/// through every tick thereafter.
+struct SignalsRuntime {
+    conditioner: SignalConditioner,
+    latch: ThrottleLatch,
+    /// GPU capability probe, `None` when no GPU sensor is present. Refreshed
+    /// on GPU re-discovery (`reset_gpu` + a fresh `probe_caps`).
+    caps: Option<GpuCaps>,
+    /// Wall-clock time of the previous tick, used to compute the elapsed
+    /// seconds fed to `ThrottleLatch::update`. Independent of the alarm
+    /// ladder's own `last_tick` variable so this module's timing can never
+    /// perturb legacy alarm-ladder dwell accounting.
+    last_tick: Instant,
+    /// Ticks since the cached GPU power limit was last refreshed; compared
+    /// against `POWER_LIMIT_REFRESH_TICKS` via the existing `should_reprobe`
+    /// cadence helper.
+    ticks_since_power_limit_probe: u32,
+}
+
+/// One human-readable `margin=...` token for the startup capability log,
+/// naming the source when margin is live.
+fn margin_log_token(margin: MarginSource) -> String {
+    match margin {
+        MarginSource::GpuMaxMinusTemp { .. } => "true(GpuMaxMinusTemp)".to_string(),
+        MarginSource::TlimitField => "true(TlimitField)".to_string(),
+        MarginSource::Unavailable => "false".to_string(),
+    }
+}
+
+/// Builds this tick's raw `SignalReadings` from the already-read CPU/GPU
+/// temperatures plus (when a GPU and its capability probe are both present)
+/// a fresh NVML multi-signal read. Never touches hardware beyond the one
+/// `read_signals` call; a missing GPU/caps simply yields temps-only readings.
+/// Real (non-`NotSupported`) NVML read failures are folded into
+/// `unifand_signal_errors_total` for the three signals that have a
+/// corresponding `SignalKind` (power, margin, mem_temp) — throttle-reason
+/// reads have no curve-fusion `SignalKind` of their own, so a throttle read
+/// failure is only `log::debug!`-logged by `classify_read`, not counted.
+fn build_signal_readings(
+    gpu: &Option<GpuSensor>,
+    caps: &Option<GpuCaps>,
+    temps: &TempReadings,
+    m: &metrics::Metrics,
+) -> SignalReadings {
+    let mut raw = match (gpu, caps) {
+        (Some(g), Some(c)) => {
+            let (readings, errors) = g.read_signals(c);
+            if errors.power {
+                m.inc_signal_error(SignalKind::GpuPower);
+            }
+            if errors.margin {
+                m.inc_signal_error(SignalKind::ThermalMargin);
+            }
+            if errors.mem_temp {
+                m.inc_signal_error(SignalKind::MemTemp);
+            }
+            readings
+        }
+        _ => SignalReadings::default(),
+    };
+    raw.gpu_temp_c = temps.gpu;
+    raw.cpu_temp_c = temps.cpu;
+    raw
 }
 
 fn parse_args() -> Args {
@@ -248,6 +316,39 @@ fn main() -> Result<()> {
         let (ctrl, degraded) = control_temp(temps.gpu, temps.cpu, cfg.cpu_offset);
         let duty = ctrl.map(|t| curve::interpolate(&cfg.curve, t));
         println!("gpu={:?} cpu={:?} control={ctrl:?} degraded={degraded} -> duty={duty:?} (hub untouched)", temps.gpu, temps.cpu);
+
+        // Fusion preview: read-only, touches no hardware beyond the NVML
+        // reads `read_temps`/`GpuSensor::probe_caps`/`read_signals` already
+        // perform above (never the hub). Uses a fresh, one-shot
+        // conditioner/throttle-state — there is no prior tick to hold state
+        // across in a single-shot invocation.
+        if cfg.signals.enabled {
+            let caps = gpu.as_ref().map(|g| g.probe_caps());
+            let mut raw = match (&gpu, &caps) {
+                (Some(g), Some(c)) => g.read_signals(c).0,
+                _ => SignalReadings::default(),
+            };
+            raw.gpu_temp_c = temps.gpu;
+            raw.cpu_temp_c = temps.cpu;
+
+            let mut conditioner = SignalConditioner::new(&cfg.signals);
+            let cond = conditioner.update(&raw);
+            let throttle_active = raw.throttle.any_of(&cfg.signals.throttle.reasons);
+            let fusion = fuse(&cfg.signals, &cfg.curve, &cond, throttle_active);
+
+            for candidate in fusion.candidates.iter().flatten() {
+                println!(
+                    "signal={} value={:.2} candidate_duty={}",
+                    candidate.kind.as_str(),
+                    candidate.value,
+                    candidate.duty
+                );
+            }
+            println!(
+                "fusion winner={:?} target={:?} floor_applied={}",
+                fusion.winner, fusion.target, fusion.floor_applied
+            );
+        }
         return Ok(());
     }
 
@@ -309,6 +410,36 @@ fn main() -> Result<()> {
                 }
             }
         }
+    };
+
+    // Multi-signal fusion runtime: constructed once, only when
+    // cfg.signals.enabled, and threaded through every tick thereafter. The
+    // ONE startup log line below names which GPU-derived signals are
+    // actually live on this hardware, from the same capability probe the
+    // per-tick reads use.
+    let mut signals_rt: Option<SignalsRuntime> = if cfg.signals.enabled {
+        let caps = gpu.as_ref().map(|g| g.probe_caps());
+        let (power, margin, mem_temp, throttle) = match &caps {
+            Some(c) => (c.power, margin_log_token(c.margin), c.mem_temp, c.throttle),
+            None => (
+                false,
+                margin_log_token(MarginSource::Unavailable),
+                false,
+                false,
+            ),
+        };
+        log::info!(
+            "signals: power={power} margin={margin} mem_temp={mem_temp} throttle={throttle}"
+        );
+        Some(SignalsRuntime {
+            conditioner: SignalConditioner::new(&cfg.signals),
+            latch: ThrottleLatch::new(cfg.signals.throttle.hold_secs),
+            caps,
+            last_tick: Instant::now(),
+            ticks_since_power_limit_probe: 0,
+        })
+    } else {
+        None
     };
 
     let mut ctl = Controller::new(cfg.hysteresis_c, cfg.min_duty_delta, cfg.max_step_per_tick);
@@ -374,21 +505,113 @@ fn main() -> Result<()> {
         let (ctrl_t, degraded) = control_temp(temps.gpu, temps.cpu, cfg.cpu_offset);
         m.set_degraded(degraded);
 
+        // THE ONE INVIOLABLE RULE: when `[signals]` is absent or disabled,
+        // behavior is EXACTLY v0.5.1 — the `else` arm below is that code,
+        // copied verbatim (see docs/superpowers/plans/wave-7-report.md for
+        // the diff-walkthrough proving it).
         let mut fallback_active = false;
-        let decision = match ctrl_t {
-            Some(t) => {
+        let (decision, thermal_hints): (Option<u8>, ThermalHints) = if cfg.signals.enabled {
+            let sr = signals_rt
+                .as_mut()
+                .expect("signals_rt is constructed whenever cfg.signals.enabled");
+
+            // Periodic refresh of the cached enforced power limit — an
+            // `nvidia-smi -pl` change mid-run must not silently rescale a
+            // percent_tdp curve forever. Reuses the existing `should_reprobe`
+            // cadence helper with `missing_or_failing: true` since this
+            // refresh is unconditionally periodic, not gated on absence.
+            if should_reprobe(
+                true,
+                sr.ticks_since_power_limit_probe,
+                POWER_LIMIT_REFRESH_TICKS,
+            ) {
+                sr.ticks_since_power_limit_probe = 0;
+                if let (Some(g), Some(caps)) = (gpu.as_ref(), sr.caps.as_mut()) {
+                    g.refresh_power_limit(caps);
+                }
+            } else {
+                sr.ticks_since_power_limit_probe += 1;
+            }
+
+            let raw = build_signal_readings(&gpu, &sr.caps, &temps, &m);
+            let cond = sr.conditioner.update(&raw);
+
+            let sig_now = Instant::now();
+            let sig_elapsed = sig_now.duration_since(sr.last_tick).as_secs();
+            sr.last_tick = sig_now;
+            let throttle_active = raw.throttle.any_of(&cfg.signals.throttle.reasons);
+            let latched = sr.latch.update(throttle_active, sig_elapsed);
+
+            let fusion = fuse(&cfg.signals, &cfg.curve, &cond, latched);
+
+            // Metrics hand-off (Wave 5): the candidate-duty setter fires for
+            // EVERY signal fuse() produced a candidate for, winners AND
+            // non-winners — unifand_control_signal's one-hot block is keyed
+            // off these entries.
+            for &kind in SignalKind::ALL.iter() {
+                if let Some(v) = cond.values[kind.idx()] {
+                    m.set_signal_value(kind, v);
+                }
+            }
+            for candidate in fusion.candidates.iter().flatten() {
+                m.set_candidate_duty(candidate.kind, candidate.duty);
+            }
+            if let Some(winner) = fusion.winner {
+                m.set_control_signal(winner);
+            }
+            if let Some(limit) = cond.gpu_power_limit_w {
+                m.set_gpu_power_limit_watts(limit);
+            }
+            m.set_throttle(cond.throttle);
+            m.set_throttle_floor_active(fusion.floor_applied);
+
+            let fusion_decision = match fusion.target {
+                Some(target) => ctl.decide_target(target),
+                None => {
+                    // Same fallback path the legacy arm takes: no curve
+                    // signal AND no throttle floor produced a target at all.
+                    log::error!(
+                        "all signals unavailable; applying fallback duty {}%",
+                        cfg.fallback_duty
+                    );
+                    fallback_active = true;
+                    ctl.force(cfg.fallback_duty);
+                    Some(cfg.fallback_duty)
+                }
+            };
+
+            // unifand_degraded keeps its exact current meaning (GPU
+            // *temperature* missing) via control_temp, called here too even
+            // though fusion doesn't use it to pick duty.
+            if let Some(t) = ctrl_t {
                 m.set_temp("control", t);
-                ctl.decide(&cfg.curve, t)
             }
-            None => {
-                log::error!(
-                    "all sensors unavailable; applying fallback duty {}%",
-                    cfg.fallback_duty
-                );
-                fallback_active = true;
-                ctl.force(cfg.fallback_duty);
-                Some(cfg.fallback_duty)
-            }
+
+            let hints = ThermalHints {
+                thermal_margin_c: cond.values[SignalKind::ThermalMargin.idx()],
+                thermal_throttling: latched,
+            };
+
+            (fusion_decision, hints)
+        } else {
+            (
+                match ctrl_t {
+                    Some(t) => {
+                        m.set_temp("control", t);
+                        ctl.decide(&cfg.curve, t)
+                    }
+                    None => {
+                        log::error!(
+                            "all sensors unavailable; applying fallback duty {}%",
+                            cfg.fallback_duty
+                        );
+                        fallback_active = true;
+                        ctl.force(cfg.fallback_duty);
+                        Some(cfg.fallback_duty)
+                    }
+                },
+                ThermalHints::default(),
+            )
         };
         m.set_fallback_active(fallback_active);
 
@@ -503,7 +726,7 @@ fn main() -> Result<()> {
                 duty: last_applied.unwrap_or(0),
                 fallback_active,
             };
-            if let Some(name) = machine.tick(&inputs, elapsed) {
+            if let Some(name) = machine.tick_with(&inputs, &thermal_hints, elapsed) {
                 log::info!("alarm ladder state -> {name}");
             }
         }
@@ -612,6 +835,16 @@ fn main() -> Result<()> {
                 log::info!("gpu sensor (re)discovered");
                 gpu = Some(s);
                 gpu_fail_streak = 0;
+                // Driver restarted / capability appeared mid-run: re-probe
+                // capabilities and reset the GPU-derived filters so stale
+                // conditioner state from the old NVML handle isn't blended
+                // with readings from the fresh one.
+                if let Some(sr) = signals_rt.as_mut() {
+                    if let Some(g) = gpu.as_ref() {
+                        sr.caps = Some(g.probe_caps());
+                    }
+                    sr.conditioner.reset_gpu();
+                }
             }
         } else {
             ticks_since_gpu_probe += 1;

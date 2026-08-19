@@ -4,12 +4,9 @@
 //! deliberately kept import-free of `nvml_wrapper` so the whole fusion
 //! pipeline (plausibility filtering, asymmetric smoothing, curve lookup,
 //! max-of-candidates fusion, throttle floor) is exercisable and testable
-//! without a GPU. Wave 3 (`src/sensors.rs`) is responsible for producing
+//! without a GPU. `src/sensors.rs` is responsible for producing
 //! `SignalReadings` from real hardware; this module only consumes them.
-//!
-//! Not yet wired into the control loop (Wave 7 does that), so `#[allow(dead_code)]`
-//! suppresses the expected "never constructed/used" lint for this wave.
-#![allow(dead_code)]
+//! Wired into the control loop by `main.rs`.
 
 use crate::config::{CurvePoint, PowerUnit, SignalsConfig, ThrottleReason};
 
@@ -185,6 +182,11 @@ impl AsymEwma {
         Some(next)
     }
 
+    /// Read accessor for the filter's current smoothed value. `main.rs`
+    /// only ever consumes `update`'s return value, so this is exercised by
+    /// tests only; kept as documented API symmetry with `reset()`, hence
+    /// the narrow `allow(dead_code)`.
+    #[allow(dead_code)]
     pub fn value(&self) -> Option<f64> {
         self.value
     }
@@ -303,6 +305,11 @@ impl ThrottleLatch {
         }
     }
 
+    /// Read accessor for the latch's current state. `main.rs` only ever
+    /// consumes `update`'s return value (the same bool), so this is
+    /// exercised by tests only; kept as documented API symmetry, hence the
+    /// narrow `allow(dead_code)`.
+    #[allow(dead_code)]
     pub fn active(&self) -> bool {
         self.remaining_secs > 0
     }

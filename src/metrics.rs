@@ -115,7 +115,6 @@ impl Metrics {
     }
 
     /// Conditioned (smoothed) value of one available input signal.
-    #[allow(dead_code)] // wired by Wave 7's control-loop integration
     pub fn set_signal_value(&self, signal: SignalKind, v: f64) {
         self.state()
             .signal_values
@@ -123,7 +122,6 @@ impl Metrics {
     }
     /// Duty this signal's own curve would command this tick, independent of
     /// whether it ends up winning the max-of-candidates fusion.
-    #[allow(dead_code)] // wired by Wave 7's control-loop integration
     pub fn set_candidate_duty(&self, signal: SignalKind, duty: u8) {
         self.state()
             .signal_candidate_duty
@@ -134,30 +132,25 @@ impl Metrics {
     /// signal with a candidate duty registered) rather than as a single
     /// info-series whose label value changes, which would leave stale
     /// timeseries behind and break rate()/graphing across a hand-off.
-    #[allow(dead_code)] // wired by Wave 7's control-loop integration
     pub fn set_control_signal(&self, winner: SignalKind) {
         self.state().control_signal = Some(winner.as_str());
     }
     /// Enforced GPU power limit, when known. Enables percent-of-limit
     /// dashboards regardless of which unit the power curve itself uses.
-    #[allow(dead_code)] // wired by Wave 7's control-loop integration
     pub fn set_gpu_power_limit_watts(&self, v: f64) {
         self.state().gpu_power_limit_w = Some(v);
     }
     /// Snapshot of NVML throttle-reason bits for this tick.
-    #[allow(dead_code)] // wired by Wave 7's control-loop integration
     pub fn set_throttle(&self, flags: ThrottleFlags) {
         self.state().throttle = Some(flags);
     }
     /// 1 while the throttle floor is raising the applied duty above what the
     /// fused signals alone would command (including its hold window).
-    #[allow(dead_code)] // wired by Wave 7's control-loop integration
     pub fn set_throttle_floor_active(&self, v: bool) {
         self.state().throttle_floor_active = v;
     }
     /// A REAL read failure for this signal (not `NotSupported`, which means
     /// the signal is simply absent from this card/driver).
-    #[allow(dead_code)] // wired by Wave 7's control-loop integration
     pub fn inc_signal_error(&self, signal: SignalKind) {
         *self
             .state()
