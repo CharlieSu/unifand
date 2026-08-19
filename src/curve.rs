@@ -1,8 +1,3 @@
-//! `decide_target` is not yet wired into the control loop (Wave 7 does
-//! that), so `#[allow(dead_code)]` suppresses the expected "never used"
-//! lint for it in the meantime — mirrors `src/signals.rs`/`src/sensors.rs`.
-#![allow(dead_code)]
-
 use crate::config::CurvePoint;
 
 /// Piecewise-linear interpolation over a sorted curve, clamped at both ends.
@@ -62,6 +57,10 @@ impl Controller {
     /// `last_temp` is never read or written, so the hysteresis hold
     /// degenerates to a pure `duty_gap >= min_duty_delta` check in duty
     /// space.
+    ///
+    /// Not yet wired into the control loop (Wave 7 does that; only this
+    /// module's own tests call it so far), hence `allow(dead_code)`.
+    #[allow(dead_code)]
     pub fn decide_target(&mut self, target: u8) -> Option<u8> {
         self.step_toward(target, None)
     }
@@ -228,6 +227,27 @@ mod tests {
         ctl.decide_target(35);
         assert_eq!(ctl.decide_target(100), Some(45));
         assert_eq!(ctl.decide_target(100), Some(55));
+    }
+
+    #[test]
+    fn decide_target_duty_gap_zero_does_not_touch_last_temp() {
+        // With any positive min_duty_delta, duty_gap == 0 always satisfies
+        // `duty_gap < min_duty_delta` (since temp_moved is unconditionally
+        // false when temp is None), so the FIRST early return (hysteresis
+        // hold) always intercepts before the second (`duty_gap == 0`)
+        // branch is ever reached. min_duty_delta 0 is required to reach it:
+        // duty_gap (unsigned) can never be < 0.
+        let mut ctl = Controller::new(2.0, 0, 10);
+        assert_eq!(ctl.decide_target(35), Some(35));
+        // Same target again: duty_gap == 0, falls through the first branch
+        // (0 < 0 is false) and hits the second -- must return None WITHOUT
+        // assigning last_temp, since temp is None throughout decide_target.
+        assert_eq!(ctl.decide_target(35), None);
+        assert!(
+            ctl.last_temp.is_nan(),
+            "decide_target must never assign last_temp; got {}",
+            ctl.last_temp
+        );
     }
 
     #[test]
