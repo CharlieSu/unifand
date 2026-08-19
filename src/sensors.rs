@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use nvml_wrapper::enum_wrappers::device::{TemperatureSensor, TemperatureThreshold};
+use nvml_wrapper::error::NvmlError;
 use nvml_wrapper::structs::device::FieldId;
 use nvml_wrapper::sys_exports::field_id;
 use nvml_wrapper::Nvml;
@@ -141,20 +142,32 @@ impl GpuSensor {
             dev.field_values_for(&ids)
         };
         let fields = match batched {
-            Ok(samples) => FIELD_IDS
-                .iter()
-                .zip(samples)
-                .map(|(&(id, name), sample)| {
-                    let rendered = match sample {
-                        Ok(fv) => match fv.value {
-                            Ok(v) => Ok(format!("{v:?}")),
+            // Pad rather than zip-truncate: nvml-wrapper 0.12.1 returns exactly
+            // one sample per requested id, but if that invariant ever changed a
+            // bare zip would silently drop field lines -- and "prints every
+            // field" is this tool's whole contract. A short result now shows up
+            // as an explicit per-field error instead of a vanished line.
+            Ok(mut samples) => {
+                if samples.len() < FIELD_IDS.len() {
+                    let missing = FIELD_IDS.len() - samples.len();
+                    samples
+                        .extend(std::iter::repeat_with(|| Err(NvmlError::Unknown)).take(missing));
+                }
+                FIELD_IDS
+                    .iter()
+                    .zip(samples)
+                    .map(|(&(id, name), sample)| {
+                        let rendered = match sample {
+                            Ok(fv) => match fv.value {
+                                Ok(v) => Ok(format!("{v:?}")),
+                                Err(e) => Err(e.to_string()),
+                            },
                             Err(e) => Err(e.to_string()),
-                        },
-                        Err(e) => Err(e.to_string()),
-                    };
-                    (id, name, rendered)
-                })
-                .collect(),
+                        };
+                        (id, name, rendered)
+                    })
+                    .collect()
+            }
             Err(e) => {
                 let msg = e.to_string();
                 FIELD_IDS
