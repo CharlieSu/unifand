@@ -11,8 +11,7 @@
 //! suppresses the expected "never constructed/used" lint for this wave.
 #![allow(dead_code)]
 
-use crate::config::CurvePoint;
-use serde::Deserialize;
+use crate::config::{CurvePoint, PowerUnit, SignalsConfig, ThrottleReason};
 
 /// One of the five signals the fusion core can fold into a duty target.
 ///
@@ -99,18 +98,6 @@ impl ThrottleFlags {
             ThrottleReason::SwPowerCap => self.sw_power_cap,
         })
     }
-}
-
-/// Config-facing enum naming a throttle reason, for the set of reasons that
-/// should latch the throttle floor (`[signals.throttle] reasons = [...]`,
-/// Wave 2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThrottleReason {
-    SwThermal,
-    HwThermal,
-    HwPowerBrake,
-    SwPowerCap,
 }
 
 /// Plausibility guard: rejects non-finite values and values outside a
@@ -204,86 +191,6 @@ impl AsymEwma {
 
     pub fn reset(&mut self) {
         self.value = None;
-    }
-}
-
-// ---------------------------------------------------------------------
-// Config stand-ins.
-//
-// config.rs does not yet define these types (Wave 2 adds the real
-// `[signals]` section with `#[serde(default)]` and gated validation,
-// mirroring `[rgb]`). To keep this wave self-contained and compiling,
-// minimal versions live here for now.
-// moved to config.rs in Wave 2
-// ---------------------------------------------------------------------
-
-/// Per-signal enable flag + curve, for the four signals that don't need
-/// anything beyond that (mem_temp, thermal_margin, gpu_temp; gpu_power and
-/// cpu_temp have their own richer config structs below).
-#[derive(Debug, Clone, Default)]
-pub struct SignalCurveConfig {
-    pub enabled: bool,
-    pub curve: Vec<CurvePoint>,
-}
-
-/// Unit the configured gpu_power curve's X axis is expressed in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PowerUnit {
-    Watts,
-    #[default]
-    PercentTdp,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct GpuPowerConfig {
-    pub enabled: bool,
-    pub curve: Vec<CurvePoint>,
-    pub unit: PowerUnit,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CpuTempConfig {
-    pub enabled: bool,
-    pub curve: Vec<CurvePoint>,
-    pub offset_c: f64,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ThrottleConfig {
-    pub enabled: bool,
-    pub floor_duty: u8,
-    pub hold_secs: u64,
-}
-
-/// `[signals]` config section (stand-in — see module note above).
-#[derive(Debug, Clone)]
-pub struct SignalsConfig {
-    /// Applied uniformly to all 5 signal filters in `SignalConditioner`.
-    /// Defaults (rise 0.5 / fall 0.1 at a 5 s tick) give τ_rise ≈ 7 s,
-    /// τ_fall ≈ 47 s.
-    pub rise_alpha: f64,
-    pub fall_alpha: f64,
-    pub mem_temp: SignalCurveConfig,
-    pub thermal_margin: SignalCurveConfig,
-    pub gpu_temp: SignalCurveConfig,
-    pub gpu_power: GpuPowerConfig,
-    pub cpu_temp: CpuTempConfig,
-    pub throttle: ThrottleConfig,
-}
-
-impl Default for SignalsConfig {
-    fn default() -> Self {
-        Self {
-            rise_alpha: 0.5,
-            fall_alpha: 0.1,
-            mem_temp: SignalCurveConfig::default(),
-            thermal_margin: SignalCurveConfig::default(),
-            gpu_temp: SignalCurveConfig::default(),
-            gpu_power: GpuPowerConfig::default(),
-            cpu_temp: CpuTempConfig::default(),
-            throttle: ThrottleConfig::default(),
-        }
     }
 }
 
@@ -729,6 +636,7 @@ mod tests {
         cfg.gpu_temp.enabled = true; // curve empty -> falls back to top_curve
         cfg.cpu_temp.enabled = true;
         cfg.cpu_temp.curve = linear_curve();
+        cfg.cpu_temp.offset_c = 0.0; // isolate max-of-candidates from offset behavior (covered separately below)
 
         let mut cond = Conditioned::default();
         cond.values[SignalKind::GpuTemp.idx()] = Some(40.0);
