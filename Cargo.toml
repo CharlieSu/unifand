@@ -2,7 +2,13 @@
 name = "unifand"
 version = "0.6.1"
 edition = "2021"
-rust-version = "1.97"
+# Tracks the pinned toolchain exactly (mise.toml, Dockerfile, ci.yaml) via
+# renovate.json5's "rust toolchain" group — NOT a back-compat policy. unifand is
+# never published to crates.io and ships only as a container image, so nothing
+# consumes an MSRV promise; this exists to give a clear "requires rustc X"
+# error instead of a confusing compile failure when someone builds outside
+# `mise install`. Three-part on purpose so one regex shape covers all four pins.
+rust-version = "1.98.0"
 license = "MIT"
 description = "GPU-led fan-curve daemon for the Lian Li UNI HUB SL V2"
 repository = "https://github.com/CharlieSu/unifand"

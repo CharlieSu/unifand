@@ -29,6 +29,8 @@
   //   github-actions — .github/workflows/* (SHA pins per the preset above)
   //   mise           — mise.toml [tools] (rust)
   //   dockerfile     — digest-pinned FROM lines (updates tag+digest together)
+  //   custom.regex   — CI's `toolchain:` input + Cargo.toml `rust-version`
+  //                    (see customManagers at the bottom)
 
   // Refresh transitive deps (Cargo.lock) monthly even without manifest bumps.
   lockFileMaintenance: { enabled: true, schedule: ["before 6am on the first day of the month"] },
@@ -36,11 +38,30 @@
   packageRules: [
     {
       // The Rust toolchain is pinned in four places that must move together:
-      // mise.toml, the Dockerfile builder image, and CI's `toolchain:` input
-      // (custom manager below). Group them into a single PR.
+      // mise.toml, the Dockerfile builder image, CI's `toolchain:` input, and
+      // Cargo.toml's `rust-version` (the last two via custom managers below).
+      // Group them into a single PR.
+      //
+      // `fix`, not `chore`, on purpose: the builder image recompiles the
+      // shipped binary. Same reasoning as the dockerfile rule below.
       groupName: "rust toolchain",
       matchPackageNames: ["rust", "rust-lang/rust"],
       matchManagers: ["mise", "dockerfile", "custom.regex"],
+      semanticCommitType: "fix",
+    },
+    {
+      // Anything baked into the shipped image must cut a release. ci.yaml
+      // pushes to GHCR only on v* tags and nothing rebuilds on a schedule, so
+      // a distroless base-image CVE fix landing as `chore` reaches nobody:
+      // release-please gates on changelog *visibility* and `chore` is a hidden
+      // section, so it renders nothing and skips the release PR. `fix` renders
+      // and yields a patch bump.
+      //
+      // cargo is deliberately absent: config:recommended already types
+      // [dependencies] as `fix` and [dev-dependencies] as `chore`, which is
+      // exactly right — dev-deps never enter the image.
+      matchManagers: ["dockerfile"],
+      semanticCommitType: "fix",
     },
     {
       groupName: "github-actions",
@@ -78,11 +99,21 @@
       datasourceTemplate: "github-releases",
       extractVersionTemplate: "^(?<version>.+)$",
     },
+    {
+      // Cargo.toml `rust-version` mirrors the pinned toolchain exactly (see
+      // the note beside it) rather than stating an MSRV policy, so it rides
+      // along in the "rust toolchain" group above.
+      customType: "regex",
+      fileMatch: ["^Cargo\\.toml$"],
+      matchStrings: ["rust-version\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
+      depNameTemplate: "rust",
+      packageNameTemplate: "rust-lang/rust",
+      datasourceTemplate: "github-releases",
+      extractVersionTemplate: "^(?<version>.+)$",
+    },
   ],
 
   // NOT managed here on purpose:
-  // - Cargo.toml `rust-version` (MSRV) — a compatibility policy statement,
-  //   bumped deliberately, not chased to latest.
   // - deploy/base image tag — the git tree ships an unpinned template; the
   //   release artifact carries the digest pin (set by CI at tag time).
 }

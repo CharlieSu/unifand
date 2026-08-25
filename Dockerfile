@@ -4,9 +4,10 @@
 # at native-build times; the runtime stage below only COPYs, so no target-arch
 # code ever executes during the build.
 #
-# rust:1.97.1-slim-trixie — explicit Debian generation (not the floating
-# "-slim" alias, which silently rolls to whatever Debian is current stable
-# and could drift ahead of the distroless runtime's glibc below).
+# Explicit Debian generation ("-slim-trixie", not the floating "-slim" alias,
+# which silently rolls to whatever Debian is current stable and could drift
+# ahead of the distroless runtime's glibc below). Deliberately no version
+# number in this comment: Renovate updates the FROM line, never the prose.
 FROM --platform=$BUILDPLATFORM rust:1.98.0-slim-trixie@sha256:cc0448b41c3b7b7fea44f5dc50eacba729a56db365b65b7bd5e8a82d5b3db078 AS builder
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
