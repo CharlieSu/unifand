@@ -7,7 +7,7 @@
 # rust:1.97.1-slim-trixie — explicit Debian generation (not the floating
 # "-slim" alias, which silently rolls to whatever Debian is current stable
 # and could drift ahead of the distroless runtime's glibc below).
-FROM --platform=$BUILDPLATFORM rust:1.97.1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS builder
+FROM --platform=$BUILDPLATFORM rust:1.98.0-slim-trixie@sha256:cc0448b41c3b7b7fea44f5dc50eacba729a56db365b65b7bd5e8a82d5b3db078 AS builder
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
 WORKDIR /app
