@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/) —
 with the pre-1.0 caveat that minor version bumps may carry breaking changes
 (protocol/metric shape changes), called out explicitly below.
 
+## [0.6.2](https://github.com/CharlieSu/unifand/compare/v0.6.1...v0.6.2) (2026-08-25)
+
+
+### Bug Fixes
+
+* **build:** sync Rust pins and release image-affecting dep updates ([1159b23](https://github.com/CharlieSu/unifand/commit/1159b2337c4c48ed7cf0778f239a298fdbe56f18))
+
 ## [0.6.1](https://github.com/CharlieSu/unifand/compare/v0.6.0...v0.6.1) (2026-08-19)
 
 
