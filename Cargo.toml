@@ -1,6 +1,6 @@
 [package]
 name = "unifand"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 # Tracks the pinned toolchain exactly (mise.toml, Dockerfile, ci.yaml) via
 # renovate.json5's "rust toolchain" group — NOT a back-compat policy. unifand is
