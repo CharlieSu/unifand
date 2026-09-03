@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/) —
 with the pre-1.0 caveat that minor version bumps may carry breaking changes
 (protocol/metric shape changes), called out explicitly below.
 
+## [0.6.3](https://github.com/CharlieSu/unifand/compare/v0.6.2...v0.6.3) (2026-09-03)
+
+
+### Bug Fixes
+
+* **deps:** update rust crate nvml-wrapper to 0.13 ([#32](https://github.com/CharlieSu/unifand/issues/32)) ([325d7de](https://github.com/CharlieSu/unifand/commit/325d7dee51e10829bf6dd8a41e9c62042ecae55c))
+* **deps:** update rust:1.98.0-slim-trixie docker digest to 17d1ba8 ([#28](https://github.com/CharlieSu/unifand/issues/28)) ([a636df3](https://github.com/CharlieSu/unifand/commit/a636df3910784b98f48a3dc0ad0c153233e07f01))
+
 ## [0.6.2](https://github.com/CharlieSu/unifand/compare/v0.6.1...v0.6.2) (2026-08-25)
 
 
