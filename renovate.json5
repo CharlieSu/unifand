@@ -27,26 +27,64 @@
   // Managers active for this repo (all built-in):
   //   cargo          — Cargo.toml deps + Cargo.lock
   //   github-actions — .github/workflows/* (SHA pins per the preset above)
-  //   mise           — mise.toml [tools] (rust)
   //   dockerfile     — digest-pinned FROM lines (updates tag+digest together)
-  //   custom.regex   — CI's `toolchain:` input + Cargo.toml `rust-version`
+  //   custom.regex   — the three non-Dockerfile Rust toolchain pins
   //                    (see customManagers at the bottom)
+  // The built-in mise manager is disabled for `rust`, and so is the
+  // github-actions manager's native `toolchain:` extraction — see the first
+  // two packageRules for why.
 
   // Refresh transitive deps (Cargo.lock) monthly even without manifest bumps.
   lockFileMaintenance: { enabled: true, schedule: ["before 6am on the first day of the month"] },
 
   packageRules: [
+    // ---- Rust toolchain: one dependency, one clock -------------------------
+    //
+    // The toolchain is pinned in four files that MUST move together, or the
+    // image build breaks: Cargo.toml's `rust-version` is a hard gate (cargo
+    // refuses to build when the compiler is older), so if it moves before the
+    // Dockerfile's builder image, `cargo build --locked` exits 101.
+    //
+    // That is exactly what happened for 1.98.1 (PRs #37/#38/#40): grouping by
+    // name is not enough, because a group only PRs the updates that are
+    // *eligible*, and each pin was fed by a different datasource with its own
+    // release timestamp:
+    //
+    //   mise manager           rust-version   1.98.1 @ 09-03 00:00Z
+    //   github-actions manager rust-version   (duplicate of the CI pin)
+    //   custom.regex           github-releases 1.98.1 @ 09-03 13:14Z
+    //   dockerfile             docker          1.98.1 image @ 09-09 01:46Z
+    //
+    // With a 3-day soak that is three separate PRs spread over six days, the
+    // enforcing pin landing days before the providing one. The fix is to make
+    // every pin read the SAME datasource — the Docker image, which is the last
+    // artifact to appear and the one the build actually needs. See
+    // customManagers below; these rules just remove the duplicate extractions.
     {
-      // The Rust toolchain is pinned in four places that must move together:
-      // mise.toml, the Dockerfile builder image, CI's `toolchain:` input, and
-      // Cargo.toml's `rust-version` (the last two via custom managers below).
-      // Group them into a single PR.
+      // The github-actions manager natively understands dtolnay/rust-toolchain
+      // and extracts `toolchain:` as its own `rust` dep on the rust-version
+      // datasource. That double-manages the line our custom manager owns and
+      // drags it into the github-actions group as `chore` (this is PR #37).
+      // The custom manager owns it; silence the built-in.
+      matchManagers: ["github-actions"],
+      matchDepNames: ["rust"],
+      enabled: false,
+    },
+    {
+      // Same story for mise.toml — the mise manager's rust dep rides the
+      // rust-version datasource's clock, which runs ahead of the image.
+      matchManagers: ["mise"],
+      matchDepNames: ["rust"],
+      enabled: false,
+    },
+    {
+      // All four pins, one group, one PR.
       //
       // `fix`, not `chore`, on purpose: the builder image recompiles the
       // shipped binary. Same reasoning as the dockerfile rule below.
       groupName: "rust toolchain",
-      matchPackageNames: ["rust", "rust-lang/rust"],
-      matchManagers: ["mise", "dockerfile", "custom.regex"],
+      matchManagers: ["dockerfile", "custom.regex"],
+      matchPackageNames: ["rust"],
       semanticCommitType: "fix",
     },
     {
@@ -81,35 +119,52 @@
       // toolchain bump rebuilds the world and can change clippy's verdicts,
       // and the four-way pin sync deserves eyes. Toolchain patches still
       // automerge via the rule above.
-      matchPackageNames: ["rust", "rust-lang/rust"],
+      matchManagers: ["dockerfile", "custom.regex"],
+      matchPackageNames: ["rust"],
       matchUpdateTypes: ["minor", "major"],
       automerge: false,
     },
   ],
 
+  // Every toolchain pin outside the Dockerfile is managed here, and every one
+  // of them points at the `docker` datasource / Docker Hub `library/rust` so
+  // it shares the Dockerfile's release clock. Docker versioning keys
+  // compatibility off the tag suffix, so the Dockerfile's
+  // `1.98.0-slim-trixie` and these bare `1.98.0` pins each get the right
+  // shape from the same lookup.
   customManagers: [
     {
-      // CI pins the Rust toolchain as an action input (dtolnay/rust-toolchain
-      // `toolchain: 1.97.1`) — no built-in manager covers it.
+      // CI pins the toolchain as an action input (dtolnay/rust-toolchain
+      // `toolchain: 1.98.0`).
       customType: "regex",
-      fileMatch: ["^\\.github/workflows/.+\\.ya?ml$"],
+      managerFilePatterns: ["/^\\.github/workflows/.+\\.ya?ml$/"],
       matchStrings: ["toolchain:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       depNameTemplate: "rust",
-      packageNameTemplate: "rust-lang/rust",
-      datasourceTemplate: "github-releases",
-      extractVersionTemplate: "^(?<version>.+)$",
+      packageNameTemplate: "rust",
+      datasourceTemplate: "docker",
+      versioningTemplate: "docker",
     },
     {
       // Cargo.toml `rust-version` mirrors the pinned toolchain exactly (see
-      // the note beside it) rather than stating an MSRV policy, so it rides
-      // along in the "rust toolchain" group above.
+      // the note beside it) rather than stating an MSRV policy. This is the
+      // pin that fails the build when it runs ahead of the builder image.
       customType: "regex",
-      fileMatch: ["^Cargo\\.toml$"],
+      managerFilePatterns: ["/^Cargo\\.toml$/"],
       matchStrings: ["rust-version\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
       depNameTemplate: "rust",
-      packageNameTemplate: "rust-lang/rust",
-      datasourceTemplate: "github-releases",
-      extractVersionTemplate: "^(?<version>.+)$",
+      packageNameTemplate: "rust",
+      datasourceTemplate: "docker",
+      versioningTemplate: "docker",
+    },
+    {
+      // mise.toml [tools] rust — the local dev toolchain.
+      customType: "regex",
+      managerFilePatterns: ["/^mise\\.toml$/"],
+      matchStrings: ["rust\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
+      depNameTemplate: "rust",
+      packageNameTemplate: "rust",
+      datasourceTemplate: "docker",
+      versioningTemplate: "docker",
     },
   ],
 
