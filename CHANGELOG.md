@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/) —
 with the pre-1.0 caveat that minor version bumps may carry breaking changes
 (protocol/metric shape changes), called out explicitly below.
 
+## [0.6.4](https://github.com/CharlieSu/unifand/compare/v0.6.3...v0.6.4) (2026-09-09)
+
+
+### Bug Fixes
+
+* **deps:** update dependency rust to v1.98.1 ([#38](https://github.com/CharlieSu/unifand/issues/38)) ([057200f](https://github.com/CharlieSu/unifand/commit/057200f6acfaf2725e1e4059510930974105e7cd))
+* **deps:** update dependency rust to v1.98.1 ([#40](https://github.com/CharlieSu/unifand/issues/40)) ([ba10ce6](https://github.com/CharlieSu/unifand/commit/ba10ce60ed66fa8749ec2394ff1c5032e371775c))
+
 ## [0.6.3](https://github.com/CharlieSu/unifand/compare/v0.6.2...v0.6.3) (2026-09-03)
 
 
