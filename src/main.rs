@@ -13,10 +13,13 @@ use config::{Config, RgbConfig};
 use curve::Controller;
 use metrics::now_unix_secs;
 use sensors::{
-    control_temp, format_probe, should_reprobe, CpuSensor, GpuCaps, GpuSensor, MarginSource,
-    POWER_LIMIT_REFRESH_TICKS, REDISCOVERY_INTERVAL_TICKS,
+    control_temp, format_probe, should_reprobe, CpuSensor, GpuInfo, GpuSensor, MarginSource,
+    SignalErrors, POWER_LIMIT_REFRESH_TICKS, REDISCOVERY_INTERVAL_TICKS,
 };
-use signals::{fuse, SignalConditioner, SignalKind, SignalReadings, ThrottleLatch};
+use signals::{
+    aggregate_gpus, fuse, hottest_gpu_c, GpuReading, SignalConditioner, SignalKind, SignalReadings,
+    ThrottleLatch,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,11 +32,15 @@ struct Args {
 }
 
 struct TempReadings {
+    /// Hottest die temperature across every GPU that answered.
     gpu: Option<f64>,
     cpu: Option<f64>,
     /// True when a *read* was attempted (sensor was Some) and failed. Never
     /// true when the sensor itself is absent — that's a separate condition
-    /// (tracked by the caller via `.is_none()`) driving re-discovery.
+    /// (tracked by the caller via `.is_none()`) driving re-discovery. For
+    /// the GPU this is true when ANY card's temperature read failed, even
+    /// if another card still supplied `gpu`: a card the fans can't see is
+    /// worth a re-discovery attempt.
     gpu_read_failed: bool,
     cpu_read_failed: bool,
 }
@@ -44,18 +51,33 @@ struct TempReadings {
 struct SignalsRuntime {
     conditioner: SignalConditioner,
     latch: ThrottleLatch,
-    /// GPU capability probe, `None` when no GPU sensor is present. Refreshed
-    /// on GPU re-discovery (`reset_gpu` + a fresh `probe_caps`).
-    caps: Option<GpuCaps>,
     /// Wall-clock time of the previous tick, used to compute the elapsed
     /// seconds fed to `ThrottleLatch::update`. Independent of the alarm
     /// ladder's own `last_tick` variable so this module's timing can never
     /// perturb legacy alarm-ladder dwell accounting.
     last_tick: Instant,
-    /// Ticks since the cached GPU power limit was last refreshed; compared
-    /// against `POWER_LIMIT_REFRESH_TICKS` via the existing `should_reprobe`
-    /// cadence helper.
-    ticks_since_power_limit_probe: u32,
+}
+
+/// One tick's per-card readings plus the real read failures across them.
+type GpuTick = (Vec<GpuReading>, SignalErrors);
+
+/// One capability log line per card, at startup and on re-discovery, naming
+/// which GPU-derived signals are actually live on each — from the same
+/// probe the per-tick reads use.
+fn log_gpus(gpus: &[GpuInfo]) {
+    for g in gpus {
+        log::info!(
+            "gpu {} ({}, {}): power={} margin={} mem_temp={} throttle={} power_limit_w={:?}",
+            g.index,
+            g.name,
+            g.uuid,
+            g.caps.power,
+            margin_log_token(g.caps.margin),
+            g.caps.mem_temp,
+            g.caps.throttle,
+            g.caps.power_limit_w
+        );
+    }
 }
 
 /// One human-readable `margin=...` token for the startup capability log,
@@ -68,24 +90,23 @@ fn margin_log_token(margin: MarginSource) -> String {
     }
 }
 
-/// Builds this tick's raw `SignalReadings` from the already-read CPU/GPU
-/// temperatures plus (when a GPU and its capability probe are both present)
-/// a fresh NVML multi-signal read. Never touches hardware beyond the one
-/// `read_signals` call; a missing GPU/caps simply yields temps-only readings.
-/// Real (non-`NotSupported`) NVML read failures are folded into
-/// `unifand_signal_errors_total`: power, margin and mem_temp under their own
-/// `SignalKind`, and throttle-reason reads under a bare "throttle" label —
-/// it has no curve-fusion `SignalKind`, but it gates the duty floor and the
-/// alarm's near-limit rung, so its failures must be countable too.
+/// Builds this tick's raw `SignalReadings`: the per-card GPU readings
+/// folded to their worst case (see `aggregate_gpus`) plus the CPU
+/// temperature. Touches no hardware; a missing GPU simply yields CPU-only
+/// readings. Real (non-`NotSupported`) NVML read failures are folded into
+/// `unifand_signal_errors_total`, once per tick however many cards failed:
+/// power, margin and mem_temp under their own `SignalKind`, and
+/// throttle-reason reads under a bare "throttle" label — it has no
+/// curve-fusion `SignalKind`, but it gates the duty floor and the alarm's
+/// near-limit rung, so its failures must be countable too.
 fn build_signal_readings(
-    gpu: &Option<GpuSensor>,
-    caps: &Option<GpuCaps>,
+    gpu_tick: Option<&GpuTick>,
     temps: &TempReadings,
+    power_unit: config::PowerUnit,
     m: &metrics::Metrics,
 ) -> SignalReadings {
-    let mut raw = match (gpu, caps) {
-        (Some(g), Some(c)) => {
-            let (readings, errors) = g.read_signals(c);
+    let mut raw = match gpu_tick {
+        Some((readings, errors)) => {
             if errors.power {
                 m.inc_signal_error(SignalKind::GpuPower);
             }
@@ -98,11 +119,10 @@ fn build_signal_readings(
             if errors.throttle {
                 m.inc_throttle_error();
             }
-            readings
+            aggregate_gpus(readings, power_unit)
         }
-        _ => SignalReadings::default(),
+        None => SignalReadings::default(),
     };
-    raw.gpu_temp_c = temps.gpu;
     raw.cpu_temp_c = temps.cpu;
     raw
 }
@@ -132,7 +152,9 @@ fn parse_args() -> Args {
     args
 }
 
-fn read_temps(cpu: &Option<CpuSensor>, gpu: &Option<GpuSensor>) -> TempReadings {
+/// `gpus` is this tick's per-card readings, `None` when no GPU sensor is
+/// present.
+fn read_temps(cpu: &Option<CpuSensor>, gpus: Option<&[GpuReading]>) -> TempReadings {
     let mut cpu_read_failed = false;
     let cpu_t = cpu.as_ref().and_then(|s| {
         s.read_c()
@@ -142,19 +164,10 @@ fn read_temps(cpu: &Option<CpuSensor>, gpu: &Option<GpuSensor>) -> TempReadings 
             })
             .ok()
     });
-    let mut gpu_read_failed = false;
-    let gpu_t = gpu.as_ref().and_then(|s| {
-        s.read_c()
-            .map_err(|e| {
-                log::warn!("gpu read: {e:#}");
-                gpu_read_failed = true;
-            })
-            .ok()
-    });
     TempReadings {
-        gpu: gpu_t,
+        gpu: gpus.and_then(hottest_gpu_c),
         cpu: cpu_t,
-        gpu_read_failed,
+        gpu_read_failed: gpus.is_some_and(|g| g.is_empty() || g.iter().any(|r| r.temp_c.is_none())),
         cpu_read_failed,
     }
 }
@@ -312,16 +325,24 @@ fn main() -> Result<()> {
 
     let mut cpu = CpuSensor::discover();
     let mut gpu = GpuSensor::init();
+    // Per-card identity + capability probe. Empty when no GPU sensor is
+    // present; refreshed on GPU re-discovery.
+    let mut gpu_infos: Vec<GpuInfo> = gpu.as_ref().map(|g| g.probe_all()).unwrap_or_default();
     log::info!(
-        "sensors: cpu(k10temp)={} gpu(nvml)={}",
+        "sensors: cpu(k10temp)={} gpu(nvml)={} gpus={}",
         cpu.is_some(),
-        gpu.is_some()
+        gpu.is_some(),
+        gpu_infos.len()
     );
+    log_gpus(&gpu_infos);
 
     if args.probe_gpu {
         return match &gpu {
             Some(g) => {
-                print!("{}", format_probe(&g.probe_snapshot()));
+                for index in 0..g.device_count() {
+                    println!("# gpu {index}");
+                    print!("{}", format_probe(&g.probe_snapshot(index)));
+                }
                 Ok(())
             }
             None => {
@@ -332,23 +353,28 @@ fn main() -> Result<()> {
     }
 
     if args.oneshot {
-        let temps = read_temps(&cpu, &gpu);
+        let gpu_tick = gpu.as_ref().map(|g| g.read_all(&gpu_infos));
+        let temps = read_temps(&cpu, gpu_tick.as_ref().map(|t| t.0.as_slice()));
+        for r in gpu_tick.iter().flat_map(|t| &t.0) {
+            println!(
+                "gpu[{}] name={:?} temp={:?} power_w={:?} power_limit_w={:?} margin={:?} mem_temp={:?} throttle={:?}",
+                r.index, r.name, r.temp_c, r.power_w, r.power_limit_w, r.thermal_margin_c, r.mem_temp_c, r.throttle
+            );
+        }
         let (ctrl, degraded) = control_temp(temps.gpu, temps.cpu, cfg.cpu_offset);
         let duty = ctrl.map(|t| curve::interpolate(&cfg.curve, t));
         println!("gpu={:?} cpu={:?} control={ctrl:?} degraded={degraded} -> duty={duty:?} (hub untouched)", temps.gpu, temps.cpu);
 
         // Fusion preview: read-only, touches no hardware beyond the NVML
-        // reads `read_temps`/`GpuSensor::probe_caps`/`read_signals` already
-        // perform above (never the hub). Uses a fresh, one-shot
+        // reads `GpuSensor::probe_all`/`read_all` already performed above
+        // (never the hub). Uses a fresh, one-shot
         // conditioner/throttle-state — there is no prior tick to hold state
         // across in a single-shot invocation.
         if cfg.signals.enabled {
-            let caps = gpu.as_ref().map(|g| g.probe_caps());
-            let mut raw = match (&gpu, &caps) {
-                (Some(g), Some(c)) => g.read_signals(c).0,
-                _ => SignalReadings::default(),
+            let mut raw = match &gpu_tick {
+                Some((readings, _)) => aggregate_gpus(readings, cfg.signals.gpu_power.unit),
+                None => SignalReadings::default(),
             };
-            raw.gpu_temp_c = temps.gpu;
             raw.cpu_temp_c = temps.cpu;
 
             let mut conditioner = SignalConditioner::new(&cfg.signals);
@@ -433,34 +459,14 @@ fn main() -> Result<()> {
     };
 
     // Multi-signal fusion runtime: constructed once, only when
-    // cfg.signals.enabled, and threaded through every tick thereafter. The
-    // ONE startup log line below names which GPU-derived signals are
-    // actually live on this hardware, from the same capability probe the
-    // per-tick reads use.
-    let mut signals_rt: Option<SignalsRuntime> = if cfg.signals.enabled {
-        let caps = gpu.as_ref().map(|g| g.probe_caps());
-        let (power, margin, mem_temp, throttle) = match &caps {
-            Some(c) => (c.power, margin_log_token(c.margin), c.mem_temp, c.throttle),
-            None => (
-                false,
-                margin_log_token(MarginSource::Unavailable),
-                false,
-                false,
-            ),
-        };
-        log::info!(
-            "signals: power={power} margin={margin} mem_temp={mem_temp} throttle={throttle}"
-        );
-        Some(SignalsRuntime {
-            conditioner: SignalConditioner::new(&cfg.signals),
-            latch: ThrottleLatch::new(cfg.signals.throttle.hold_secs),
-            caps,
-            last_tick: Instant::now(),
-            ticks_since_power_limit_probe: 0,
-        })
-    } else {
-        None
-    };
+    // cfg.signals.enabled, and threaded through every tick thereafter.
+    // (Which GPU-derived signals are live on each card was logged by
+    // `log_gpus` at sensor init.)
+    let mut signals_rt: Option<SignalsRuntime> = cfg.signals.enabled.then(|| SignalsRuntime {
+        conditioner: SignalConditioner::new(&cfg.signals),
+        latch: ThrottleLatch::new(cfg.signals.throttle.hold_secs),
+        last_tick: Instant::now(),
+    });
 
     let mut ctl = Controller::new(cfg.hysteresis_c, cfg.min_duty_delta, cfg.max_step_per_tick);
     let mut consecutive_errors: u32 = 0;
@@ -499,9 +505,42 @@ fn main() -> Result<()> {
     let mut gpu_fail_streak: u32 = 0;
     let mut ticks_since_cpu_probe: u32 = 0;
     let mut ticks_since_gpu_probe: u32 = 0;
+    // Ticks since the cached per-card GPU power limits were last refreshed;
+    // compared against `POWER_LIMIT_REFRESH_TICKS` via the existing
+    // `should_reprobe` cadence helper.
+    let mut ticks_since_power_limit_probe: u32 = 0;
 
     while !term.load(Ordering::Relaxed) {
-        let temps = read_temps(&cpu, &gpu);
+        // Periodic refresh of the cached enforced power limits — an
+        // `nvidia-smi -pl` change mid-run must not silently rescale a
+        // percent_tdp curve (or the per-card limit gauge) forever. Reuses
+        // the existing `should_reprobe` cadence helper with
+        // `missing_or_failing: true` since this refresh is unconditionally
+        // periodic, not gated on absence.
+        if should_reprobe(
+            true,
+            ticks_since_power_limit_probe,
+            POWER_LIMIT_REFRESH_TICKS,
+        ) {
+            ticks_since_power_limit_probe = 0;
+            if let Some(g) = gpu.as_ref() {
+                g.refresh_power_limits(&mut gpu_infos);
+            }
+        } else {
+            ticks_since_power_limit_probe += 1;
+        }
+
+        // One NVML pass over every card per tick. It feeds the per-card
+        // metrics in both control modes; the legacy path below uses only
+        // the hottest die temperature from it.
+        let gpu_tick: Option<GpuTick> = gpu.as_ref().map(|g| g.read_all(&gpu_infos));
+        let gpu_readings = gpu_tick.as_ref().map(|t| t.0.as_slice());
+        m.set_gpu_frame(gpu_readings.unwrap_or(&[]));
+        for r in gpu_readings.into_iter().flatten().filter(|r| r.read_error) {
+            m.inc_gpu_read_error(r.index);
+        }
+
+        let temps = read_temps(&cpu, gpu_readings);
         if let Some(t) = temps.gpu {
             m.set_temp("gpu", t);
         }
@@ -535,25 +574,8 @@ fn main() -> Result<()> {
                 .as_mut()
                 .expect("signals_rt is constructed whenever cfg.signals.enabled");
 
-            // Periodic refresh of the cached enforced power limit — an
-            // `nvidia-smi -pl` change mid-run must not silently rescale a
-            // percent_tdp curve forever. Reuses the existing `should_reprobe`
-            // cadence helper with `missing_or_failing: true` since this
-            // refresh is unconditionally periodic, not gated on absence.
-            if should_reprobe(
-                true,
-                sr.ticks_since_power_limit_probe,
-                POWER_LIMIT_REFRESH_TICKS,
-            ) {
-                sr.ticks_since_power_limit_probe = 0;
-                if let (Some(g), Some(caps)) = (gpu.as_ref(), sr.caps.as_mut()) {
-                    g.refresh_power_limit(caps);
-                }
-            } else {
-                sr.ticks_since_power_limit_probe += 1;
-            }
-
-            let raw = build_signal_readings(&gpu, &sr.caps, &temps, &m);
+            let raw =
+                build_signal_readings(gpu_tick.as_ref(), &temps, cfg.signals.gpu_power.unit, &m);
             let cond = sr.conditioner.update(&raw);
 
             let sig_now = Instant::now();
@@ -850,14 +872,16 @@ fn main() -> Result<()> {
                 log::info!("gpu sensor (re)discovered");
                 gpu = Some(s);
                 gpu_fail_streak = 0;
-                // Driver restarted / capability appeared mid-run: re-probe
-                // capabilities and reset the GPU-derived filters so stale
-                // conditioner state from the old NVML handle isn't blended
-                // with readings from the fresh one.
+                // Driver restarted / card or capability appeared mid-run:
+                // re-enumerate and re-probe every card, and reset the
+                // GPU-derived filters so stale conditioner state from the
+                // old NVML handle isn't blended with readings from the
+                // fresh one.
+                if let Some(g) = gpu.as_ref() {
+                    gpu_infos = g.probe_all();
+                    log_gpus(&gpu_infos);
+                }
                 if let Some(sr) = signals_rt.as_mut() {
-                    if let Some(g) = gpu.as_ref() {
-                        sr.caps = Some(g.probe_caps());
-                    }
                     sr.conditioner.reset_gpu();
                 }
             }

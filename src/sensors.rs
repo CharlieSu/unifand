@@ -5,10 +5,10 @@ use nvml_wrapper::enums::device::SampleValue;
 use nvml_wrapper::error::NvmlError;
 use nvml_wrapper::structs::device::FieldId;
 use nvml_wrapper::sys_exports::field_id;
-use nvml_wrapper::Nvml;
+use nvml_wrapper::{Device, Nvml};
 use std::path::{Path, PathBuf};
 
-use crate::signals::{SignalReadings, ThrottleFlags};
+use crate::signals::{GpuReading, ThrottleFlags};
 
 /// Pick the control temperature: hotter of GPU and offset CPU.
 /// Degraded (second element) when the GPU signal is unavailable.
@@ -55,7 +55,7 @@ pub enum MarginSource {
     },
 }
 
-/// GPU multi-signal capabilities detected once by `GpuSensor::probe_caps`,
+/// One GPU's multi-signal capabilities, detected by `GpuSensor::probe_all`
 /// at init and on re-discovery, rather than re-probed every tick.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct GpuCaps {
@@ -104,7 +104,7 @@ fn classify_read<T>(result: std::result::Result<T, NvmlError>, error_flag: &mut 
 /// `None` temp (absent or a real read failure) propagates to `None`.
 ///
 /// Exercised directly by `margin_from_threshold_computes_headroom` as well
-/// as by `read_signals`.
+/// as by `read_all`.
 pub fn margin_from_threshold(threshold_c: f64, temp_c: Option<f64>) -> Option<f64> {
     temp_c.map(|t| threshold_c - t)
 }
@@ -164,33 +164,70 @@ impl CpuSensor {
 
 /// Shared field-id slice for the batched `field_values_for` probe of NVML
 /// field 82 (MEMORY_TEMP), used identically by `probe_caps` (capability
-/// detection) and `read_signals` (the per-tick read) so the two call sites
+/// detection) and `read_all` (the per-tick read) so the two call sites
 /// can't drift as more field-based signals are added.
 const MEM_TEMP_FIELD_IDS: [FieldId; 1] = [FieldId(field_id::NVML_FI_DEV_MEMORY_TEMP)];
+
+/// One NVML device as found by `GpuSensor::probe_all`: its identity plus
+/// the capabilities probed for it. Cards are probed individually because
+/// they need not match — a workstation card may expose signals (memory
+/// temperature, say) that a consumer card beside it does not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuInfo {
+    pub index: u32,
+    pub name: String,
+    pub uuid: String,
+    pub caps: GpuCaps,
+}
 
 pub struct GpuSensor {
     nvml: Nvml,
 }
 
 impl GpuSensor {
-    /// None when libnvidia-ml.so is absent (no nvidia runtime class) or no GPU.
+    /// None when libnvidia-ml.so is absent (no nvidia runtime class) or no
+    /// GPU can be opened.
     pub fn init() -> Option<GpuSensor> {
         let nvml = Nvml::init().ok()?;
-        nvml.device_by_index(0).ok()?;
-        Some(GpuSensor { nvml })
+        let count = nvml.device_count().ok()?;
+        (0..count)
+            .any(|i| nvml.device_by_index(i).is_ok())
+            .then_some(GpuSensor { nvml })
     }
 
-    pub fn read_c(&self) -> Result<f64> {
-        let dev = self.nvml.device_by_index(0).context("nvml device 0")?;
-        let t = dev
-            .temperature(TemperatureSensor::Gpu)
-            .context("nvml temperature")?;
-        Ok(t as f64)
+    pub fn device_count(&self) -> u32 {
+        self.nvml.device_count().unwrap_or(0)
     }
 
-    /// One NVML probing round, run at init and on re-discovery: detects each
-    /// multi-signal capability by attempting the read once, rather than
-    /// re-probing per tick.
+    /// One NVML probing round over every device, run at init and on
+    /// re-discovery rather than per tick. A device that can't be opened is
+    /// still listed (with no capabilities) so its failing reads stay
+    /// visible and keep driving re-discovery, instead of the card silently
+    /// dropping out of fan control.
+    pub fn probe_all(&self) -> Vec<GpuInfo> {
+        (0..self.device_count())
+            .map(|index| match self.nvml.device_by_index(index) {
+                Ok(dev) => GpuInfo {
+                    index,
+                    name: dev.name().unwrap_or_default(),
+                    uuid: dev.uuid().unwrap_or_default(),
+                    caps: Self::probe_caps(&dev),
+                },
+                Err(e) => {
+                    log::warn!("gpu {index} probe: nvml device: {e}");
+                    GpuInfo {
+                        index,
+                        name: String::new(),
+                        uuid: String::new(),
+                        caps: GpuCaps::default(),
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Detects each multi-signal capability of one device by attempting
+    /// the read once.
     ///
     /// Margin: `MarginSource::TlimitField` (fields 193/194/196) is DEAD on
     /// this crate version — nvml-wrapper 0.12.1's `SampleValue` enum only
@@ -200,13 +237,8 @@ impl GpuSensor {
     /// fields fine); the variant stays defined for a future crate version,
     /// but `probe_caps` must never select it. Instead we use
     /// `temperature_threshold(GpuMax) - temperature(Gpu)`, which the Wave 0
-    /// spike confirmed returns a clean, stable value (`Ok(90)` on this card).
-    pub fn probe_caps(&self) -> GpuCaps {
-        let dev = match self.nvml.device_by_index(0) {
-            Ok(d) => d,
-            Err(_) => return GpuCaps::default(),
-        };
-
+    /// spike confirmed returns a clean, stable value (`Ok(90)` on that card).
+    fn probe_caps(dev: &Device) -> GpuCaps {
         let power = dev.power_usage().is_ok();
 
         let margin = match dev.temperature_threshold(TemperatureThreshold::GpuMax) {
@@ -217,7 +249,7 @@ impl GpuSensor {
         };
 
         // field 82 MEMORY_TEMP: probed via the batched field API, matching
-        // how read_signals will read it, since a device-attribute-style
+        // how read_all will read it, since a device-attribute-style
         // probe isn't available for this one.
         let mem_temp = {
             match dev.field_values_for(&MEM_TEMP_FIELD_IDS) {
@@ -243,38 +275,67 @@ impl GpuSensor {
         }
     }
 
-    /// Reads all multi-signal readings for one tick, attempting only the
-    /// capabilities `caps` found present. Never returns `Err` and never
-    /// panics — every individual NVML failure is folded into `SignalErrors`
-    /// (real failures) or silent absence (`NotSupported`, the normal answer
-    /// for silicon that lacks a signal) via `classify_read`.
-    pub fn read_signals(&self, caps: &GpuCaps) -> (SignalReadings, SignalErrors) {
-        let mut readings = SignalReadings::default();
+    /// Reads every card for one tick, attempting only the capabilities
+    /// found present on each. Never returns `Err` and never panics. Die
+    /// temperature is the one read every card must answer: its failure is
+    /// logged at warn and leaves `temp_c` `None`, which the caller treats
+    /// as a failed tick for re-discovery. Every other NVML failure is
+    /// folded into `SignalErrors` (real failures, OR-ed across cards) or
+    /// silent absence (`NotSupported`) via `classify_read`.
+    pub fn read_all(&self, gpus: &[GpuInfo]) -> (Vec<GpuReading>, SignalErrors) {
         let mut errors = SignalErrors::default();
+        let readings = gpus
+            .iter()
+            .map(|info| {
+                let (reading, e) = self.read_one(info);
+                errors.power |= e.power;
+                errors.margin |= e.margin;
+                errors.mem_temp |= e.mem_temp;
+                errors.throttle |= e.throttle;
+                reading
+            })
+            .collect();
+        (readings, errors)
+    }
 
-        let dev = match self.nvml.device_by_index(0) {
+    fn read_one(&self, info: &GpuInfo) -> (GpuReading, SignalErrors) {
+        let caps = &info.caps;
+        let mut errors = SignalErrors::default();
+        let mut reading = GpuReading {
+            index: info.index,
+            name: info.name.clone(),
+            uuid: info.uuid.clone(),
+            power_limit_w: caps.power_limit_w,
+            ..GpuReading::default()
+        };
+
+        let dev = match self.nvml.device_by_index(info.index) {
             Ok(d) => d,
             Err(e) => {
-                log::debug!("nvml device_by_index(0) failed: {e}");
-                return (readings, errors);
+                log::warn!("gpu {} read: nvml device: {e}", info.index);
+                reading.read_error = true;
+                return (reading, errors);
             }
         };
 
-        readings.gpu_power_limit_w = caps.power_limit_w;
+        match dev.temperature(TemperatureSensor::Gpu) {
+            Ok(t) => reading.temp_c = Some(t as f64),
+            Err(e) => {
+                log::warn!("gpu {} read: nvml temperature: {e}", info.index);
+                reading.read_error = true;
+            }
+        }
 
         if caps.power {
-            readings.gpu_power_w = classify_read(
+            reading.power_w = classify_read(
                 dev.power_usage().map(|mw| mw as f64 / 1000.0),
                 &mut errors.power,
             );
         }
 
         if let MarginSource::GpuMaxMinusTemp { threshold_c } = caps.margin {
-            let temp = classify_read(
-                dev.temperature(TemperatureSensor::Gpu).map(|t| t as f64),
-                &mut errors.margin,
-            );
-            readings.thermal_margin_c = margin_from_threshold(threshold_c, temp);
+            reading.thermal_margin_c = margin_from_threshold(threshold_c, reading.temp_c);
+            errors.margin = reading.temp_c.is_none();
         }
 
         if caps.mem_temp {
@@ -287,39 +348,40 @@ impl GpuSensor {
                     },
                     Err(e) => Err(e),
                 };
-            readings.mem_temp_c = classify_read(result, &mut errors.mem_temp);
+            reading.mem_temp_c = classify_read(result, &mut errors.mem_temp);
         }
 
         if caps.throttle {
-            if let Some(r) = classify_read(dev.current_throttle_reasons(), &mut errors.throttle) {
-                readings.throttle = throttle_flags(r);
-            }
+            reading.throttle = classify_read(dev.current_throttle_reasons(), &mut errors.throttle)
+                .map(throttle_flags);
         }
 
-        (readings, errors)
+        reading.read_error |= errors.power || errors.margin || errors.mem_temp || errors.throttle;
+        (reading, errors)
     }
 
-    /// Re-reads `enforced_power_limit` into `caps.power_limit_w`.
+    /// Re-reads each card's `enforced_power_limit` into its cached caps.
     /// `nvidia-smi -pl` can change the enforced limit at runtime, and a
     /// stale cached value would silently rescale a `percent_tdp` curve.
     /// Called on the `POWER_LIMIT_REFRESH_TICKS` cadence via the existing
     /// `should_reprobe` helper, not a parallel mechanism.
-    pub fn refresh_power_limit(&self, caps: &mut GpuCaps) {
-        let dev = match self.nvml.device_by_index(0) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        caps.power_limit_w = dev.enforced_power_limit().ok().map(|mw| mw as f64 / 1000.0);
+    pub fn refresh_power_limits(&self, gpus: &mut [GpuInfo]) {
+        for info in gpus {
+            let Ok(dev) = self.nvml.device_by_index(info.index) else {
+                continue;
+            };
+            info.caps.power_limit_w = dev.enforced_power_limit().ok().map(|mw| mw as f64 / 1000.0);
+        }
     }
 
     /// Read-only capability/diagnostic dump for `--probe-gpu`. Never panics
     /// and never returns `Err`; every individual NVML failure becomes an
     /// `Err(String)` in place so the struct is pure data.
-    pub fn probe_snapshot(&self) -> ProbeSnapshot {
+    pub fn probe_snapshot(&self, index: u32) -> ProbeSnapshot {
         let nvml_version = self.nvml.sys_nvml_version().map_err(|e| e.to_string());
         let driver_version = self.nvml.sys_driver_version().map_err(|e| e.to_string());
 
-        let dev = match self.nvml.device_by_index(0) {
+        let dev = match self.nvml.device_by_index(index) {
             Ok(d) => d,
             Err(e) => {
                 let msg = e.to_string();

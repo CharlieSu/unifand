@@ -1,4 +1,4 @@
-use crate::signals::{SignalKind, ThrottleFlags};
+use crate::signals::{GpuReading, SignalKind, ThrottleFlags};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,6 +30,38 @@ struct State {
     throttle: Option<ThrottleFlags>,
     throttle_floor_active: bool,
     signal_errors: BTreeMap<&'static str, u64>,
+
+    // Per-card view, replaced wholesale each tick by `set_gpu_frame`.
+    gpus: Vec<GpuReading>,
+    gpu_read_errors: BTreeMap<u32, u64>,
+}
+
+/// Escapes a Prometheus label value (backslash, double quote, newline).
+/// Only needed for the card name, which is whatever NVML reports.
+fn escape_label(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Appends one per-card gauge family, omitting the family entirely when no
+/// card has the reading and omitting individual cards that lack it.
+fn push_gpu_gauge(
+    out: &mut String,
+    gpus: &[GpuReading],
+    name: &str,
+    help: &str,
+    pick: fn(&GpuReading) -> Option<f64>,
+) {
+    if !gpus.iter().any(|g| pick(g).is_some()) {
+        return;
+    }
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+    for g in gpus {
+        if let Some(v) = pick(g) {
+            out.push_str(&format!("{name}{{gpu=\"{}\"}} {}\n", g.index, v));
+        }
+    }
 }
 
 pub struct Metrics {
@@ -187,6 +219,20 @@ impl Metrics {
         *self.state().signal_errors.entry("throttle").or_insert(0) += 1;
     }
 
+    /// Publishes this tick's per-card readings, REPLACING the previous
+    /// frame for the same reason `set_fusion_frame` does: a card that drops
+    /// off the bus (or a signal a card stops reporting) must stop emitting
+    /// rather than freeze at its last value. An empty slice clears every
+    /// per-card series.
+    pub fn set_gpu_frame(&self, gpus: &[GpuReading]) {
+        self.state().gpus = gpus.to_vec();
+    }
+    /// A tick on which at least one real (non-`NotSupported`) NVML read
+    /// failed for this card. Survives frame replacement — it's a counter.
+    pub fn inc_gpu_read_error(&self, index: u32) {
+        *self.state().gpu_read_errors.entry(index).or_insert(0) += 1;
+    }
+
     fn healthz(&self) -> bool {
         let last_tick = self.state().last_tick;
         healthz_ok(now_unix_secs(), last_tick, self.poll_interval_secs)
@@ -307,6 +353,84 @@ impl Metrics {
                 out.push_str(&format!(
                     "unifand_signal_errors_total{{signal=\"{}\"}} {}\n",
                     signal, count
+                ));
+            }
+        }
+
+        // --- Per-card GPU view (strictly additive) ---
+        // The families above carry the worst case across cards, which is
+        // what drives the fans; these say which card it came from.
+        if !s.gpus.is_empty() {
+            out.push_str("# HELP unifand_gpu_device_info One series per GPU, value always 1; join on gpu for the card's name and UUID (the index is not stable across reboots, the UUID is).\n# TYPE unifand_gpu_device_info gauge\n");
+            for g in &s.gpus {
+                out.push_str(&format!(
+                    "unifand_gpu_device_info{{gpu=\"{}\",name=\"{}\",uuid=\"{}\"}} 1\n",
+                    g.index,
+                    escape_label(&g.name),
+                    escape_label(&g.uuid)
+                ));
+            }
+            push_gpu_gauge(
+                &mut out,
+                &s.gpus,
+                "unifand_gpu_device_temp_celsius",
+                "Raw die temperature per GPU.",
+                |g| g.temp_c,
+            );
+            push_gpu_gauge(
+                &mut out,
+                &s.gpus,
+                "unifand_gpu_device_power_watts",
+                "Raw power draw per GPU.",
+                |g| g.power_w,
+            );
+            push_gpu_gauge(
+                &mut out,
+                &s.gpus,
+                "unifand_gpu_device_power_limit_watts",
+                "Enforced power limit per GPU.",
+                |g| g.power_limit_w,
+            );
+            push_gpu_gauge(
+                &mut out,
+                &s.gpus,
+                "unifand_gpu_device_thermal_margin_celsius",
+                "Headroom to each GPU's own thermal limit.",
+                |g| g.thermal_margin_c,
+            );
+            push_gpu_gauge(
+                &mut out,
+                &s.gpus,
+                "unifand_gpu_device_mem_temp_celsius",
+                "Memory junction temperature per GPU, where NVML exposes it.",
+                |g| g.mem_temp_c,
+            );
+            if s.gpus.iter().any(|g| g.throttle.is_some()) {
+                out.push_str("# HELP unifand_gpu_device_throttle_active NVML throttle reason currently asserted, per GPU.\n# TYPE unifand_gpu_device_throttle_active gauge\n");
+                for g in &s.gpus {
+                    let Some(t) = g.throttle else { continue };
+                    for (reason, active) in [
+                        ("sw_thermal", t.sw_thermal),
+                        ("hw_thermal", t.hw_thermal),
+                        ("hw_power_brake", t.hw_power_brake),
+                        ("sw_power_cap", t.sw_power_cap),
+                    ] {
+                        out.push_str(&format!(
+                            "unifand_gpu_device_throttle_active{{gpu=\"{}\",reason=\"{}\"}} {}\n",
+                            g.index,
+                            reason,
+                            if active { 1 } else { 0 }
+                        ));
+                    }
+                }
+            }
+        }
+        if !s.gpu_read_errors.is_empty() {
+            out.push_str("# HELP unifand_gpu_device_read_errors_total Ticks on which a real NVML read failed for this GPU; NotSupported is not counted.\n# TYPE unifand_gpu_device_read_errors_total counter\n");
+            for (gpu, count) in &s.gpu_read_errors {
+                out.push_str(&format!(
+                    "unifand_gpu_device_read_errors_total{{gpu=\"{}\"}} {}\n",
+                    gpu, count
                 ));
             }
         }
@@ -665,6 +789,7 @@ mod tests {
             "unifand_control_signal",
             "unifand_gpu_power_limit_watts",
             "unifand_throttle_active",
+            "unifand_gpu_device_",
         ] {
             assert!(
                 !out.contains(family),
@@ -675,5 +800,142 @@ mod tests {
         // here so "strictly additive plus this one line" stays a deliberate,
         // reviewed choice rather than drift.
         assert!(out.contains("unifand_throttle_floor_active 0"));
+    }
+
+    // -- per-card GPU metrics --------------------------------------------
+
+    fn two_cards() -> [GpuReading; 2] {
+        [
+            GpuReading {
+                index: 0,
+                name: "NVIDIA GeForce RTX 5090".to_string(),
+                uuid: "GPU-aaaa".to_string(),
+                temp_c: Some(71.0),
+                power_w: Some(412.5),
+                power_limit_w: Some(575.0),
+                thermal_margin_c: Some(19.0),
+                mem_temp_c: None,
+                throttle: Some(ThrottleFlags {
+                    sw_power_cap: true,
+                    ..ThrottleFlags::default()
+                }),
+                read_error: false,
+            },
+            GpuReading {
+                index: 1,
+                name: "NVIDIA RTX PRO 6000".to_string(),
+                uuid: "GPU-bbbb".to_string(),
+                temp_c: Some(64.0),
+                power_w: Some(300.0),
+                power_limit_w: Some(600.0),
+                thermal_margin_c: Some(26.0),
+                mem_temp_c: Some(82.0),
+                throttle: None,
+                read_error: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn gpu_frame_renders_every_reading_per_card() {
+        let m = m();
+        m.set_gpu_frame(&two_cards());
+        let out = m.render();
+        for line in [
+            "# TYPE unifand_gpu_device_temp_celsius gauge",
+            "unifand_gpu_device_temp_celsius{gpu=\"0\"} 71",
+            "unifand_gpu_device_temp_celsius{gpu=\"1\"} 64",
+            "unifand_gpu_device_power_watts{gpu=\"0\"} 412.5",
+            "unifand_gpu_device_power_watts{gpu=\"1\"} 300",
+            "unifand_gpu_device_power_limit_watts{gpu=\"0\"} 575",
+            "unifand_gpu_device_power_limit_watts{gpu=\"1\"} 600",
+            "unifand_gpu_device_thermal_margin_celsius{gpu=\"0\"} 19",
+            "unifand_gpu_device_thermal_margin_celsius{gpu=\"1\"} 26",
+            "unifand_gpu_device_mem_temp_celsius{gpu=\"1\"} 82",
+        ] {
+            assert!(out.contains(line), "missing {line:?} in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn gpu_info_identifies_each_card_by_name_and_uuid() {
+        let m = m();
+        m.set_gpu_frame(&two_cards());
+        let out = m.render();
+        assert!(out.contains(
+            "unifand_gpu_device_info{gpu=\"0\",name=\"NVIDIA GeForce RTX 5090\",uuid=\"GPU-aaaa\"} 1"
+        ));
+        assert!(out.contains(
+            "unifand_gpu_device_info{gpu=\"1\",name=\"NVIDIA RTX PRO 6000\",uuid=\"GPU-bbbb\"} 1"
+        ));
+    }
+
+    #[test]
+    fn gpu_info_escapes_label_values() {
+        let m = m();
+        m.set_gpu_frame(&[GpuReading {
+            name: "odd \"card\" \\ name".to_string(),
+            ..GpuReading::default()
+        }]);
+        assert!(m.render().contains("name=\"odd \\\"card\\\" \\\\ name\""));
+    }
+
+    #[test]
+    fn gpu_signal_a_card_does_not_expose_emits_no_series_for_it() {
+        let m = m();
+        m.set_gpu_frame(&two_cards());
+        let out = m.render();
+        // Card 0 has no memory temperature and card 1 reports no throttle
+        // reasons: absent, not zero.
+        assert!(!out.contains("unifand_gpu_device_mem_temp_celsius{gpu=\"0\"}"));
+        assert!(!out.contains("unifand_gpu_device_throttle_active{gpu=\"1\""));
+    }
+
+    #[test]
+    fn gpu_throttle_renders_all_four_reasons_per_card() {
+        let m = m();
+        m.set_gpu_frame(&two_cards());
+        let out = m.render();
+        for line in [
+            "unifand_gpu_device_throttle_active{gpu=\"0\",reason=\"sw_thermal\"} 0",
+            "unifand_gpu_device_throttle_active{gpu=\"0\",reason=\"hw_thermal\"} 0",
+            "unifand_gpu_device_throttle_active{gpu=\"0\",reason=\"hw_power_brake\"} 0",
+            "unifand_gpu_device_throttle_active{gpu=\"0\",reason=\"sw_power_cap\"} 1",
+        ] {
+            assert!(out.contains(line), "missing {line:?} in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_card_that_disappears_stops_emitting_series() {
+        let m = m();
+        let cards = two_cards();
+        m.set_gpu_frame(&cards);
+        assert!(m.render().contains("gpu=\"1\""));
+
+        m.set_gpu_frame(&cards[..1]);
+        let out = m.render();
+        assert!(
+            !out.contains("gpu=\"1\""),
+            "card 1 survived its own disappearance:\n{out}"
+        );
+        assert!(out.contains("unifand_gpu_device_temp_celsius{gpu=\"0\"} 71"));
+
+        m.set_gpu_frame(&[]);
+        assert!(!m.render().contains("unifand_gpu_device_temp_celsius"));
+    }
+
+    #[test]
+    fn gpu_read_errors_count_per_card_and_outlive_the_frame() {
+        let m = m();
+        m.inc_gpu_read_error(1);
+        m.inc_gpu_read_error(1);
+        m.inc_gpu_read_error(0);
+        // A card whose reads are failing may have nothing else to publish.
+        m.set_gpu_frame(&[]);
+        let out = m.render();
+        assert!(out.contains("# TYPE unifand_gpu_device_read_errors_total counter"));
+        assert!(out.contains("unifand_gpu_device_read_errors_total{gpu=\"0\"} 1"));
+        assert!(out.contains("unifand_gpu_device_read_errors_total{gpu=\"1\"} 2"));
     }
 }
