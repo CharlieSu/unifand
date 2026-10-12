@@ -13,8 +13,8 @@ use config::{Config, RgbConfig};
 use curve::Controller;
 use metrics::now_unix_secs;
 use sensors::{
-    control_temp, format_probe, should_reprobe, CpuSensor, GpuInfo, GpuSensor, MarginSource,
-    SignalErrors, POWER_LIMIT_REFRESH_TICKS, REDISCOVERY_INTERVAL_TICKS,
+    cards_unchanged, control_temp, format_probe, should_reprobe, CpuSensor, GpuInfo, GpuSensor,
+    MarginSource, SignalErrors, POWER_LIMIT_REFRESH_TICKS, REDISCOVERY_INTERVAL_TICKS,
 };
 use signals::{
     aggregate_gpus, fuse, hottest_gpu_c, GpuReading, SignalConditioner, SignalKind, SignalReadings,
@@ -869,20 +869,27 @@ fn main() -> Result<()> {
         ) {
             ticks_since_gpu_probe = 0;
             if let Some(s) = GpuSensor::init() {
-                log::info!("gpu sensor (re)discovered");
+                let infos = s.probe_all();
+                // One card that stays dead while the others keep answering
+                // re-trips this every interval. If the probe then finds
+                // exactly the cards we already had, nothing was
+                // (re)discovered: keep the healthy cards' filter state and
+                // stay quiet instead of resetting and re-logging each time.
+                let unchanged = cards_unchanged(temps.gpu.is_some(), &gpu_infos, &infos);
                 gpu = Some(s);
                 gpu_fail_streak = 0;
-                // Driver restarted / card or capability appeared mid-run:
-                // re-enumerate and re-probe every card, and reset the
-                // GPU-derived filters so stale conditioner state from the
-                // old NVML handle isn't blended with readings from the
-                // fresh one.
-                if let Some(g) = gpu.as_ref() {
-                    gpu_infos = g.probe_all();
+                if !unchanged {
+                    // Driver restarted / card or capability appeared
+                    // mid-run: adopt the fresh probe, and reset the
+                    // GPU-derived filters so stale conditioner state from
+                    // the old NVML handle isn't blended with readings from
+                    // the fresh one.
+                    log::info!("gpu sensor (re)discovered");
+                    gpu_infos = infos;
                     log_gpus(&gpu_infos);
-                }
-                if let Some(sr) = signals_rt.as_mut() {
-                    sr.conditioner.reset_gpu();
+                    if let Some(sr) = signals_rt.as_mut() {
+                        sr.conditioner.reset_gpu();
+                    }
                 }
             }
         } else {

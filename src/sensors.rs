@@ -180,6 +180,15 @@ pub struct GpuInfo {
     pub caps: GpuCaps,
 }
 
+/// Pure check for GPU re-discovery: true when a re-probe found nothing new,
+/// so the caller can keep its filter state. Requires that some card was
+/// still answering on the old handle (`any_card_answering`) — when none
+/// was, the handle itself is suspect (driver restart) and an identical
+/// card list still warrants a full reset.
+pub fn cards_unchanged(any_card_answering: bool, old: &[GpuInfo], new: &[GpuInfo]) -> bool {
+    any_card_answering && old == new
+}
+
 pub struct GpuSensor {
     nvml: Nvml,
 }
@@ -687,6 +696,32 @@ mod tests {
         // 0) must wait a full interval before the first reprobe, not retry
         // every tick.
         assert!(!should_reprobe(true, 0, 12));
+    }
+
+    #[test]
+    fn cards_unchanged_only_when_handle_alive_and_probe_identical() {
+        let card = |index: u32, power: bool| GpuInfo {
+            index,
+            name: "RTX".to_string(),
+            uuid: format!("GPU-{index}"),
+            caps: GpuCaps {
+                power,
+                ..GpuCaps::default()
+            },
+        };
+        let old = [card(0, true), card(1, true)];
+
+        // One card dead, the other answering, same probe: keep state.
+        assert!(cards_unchanged(true, &old, &old.clone()));
+        // No card answering: the handle is suspect, reset even if identical.
+        assert!(!cards_unchanged(false, &old, &old.clone()));
+        // A capability changed, or a card appeared/vanished: reset.
+        assert!(!cards_unchanged(
+            true,
+            &old,
+            &[card(0, true), card(1, false)]
+        ));
+        assert!(!cards_unchanged(true, &old, &[card(0, true)]));
     }
 
     fn absent<T>() -> Result<T, String> {
