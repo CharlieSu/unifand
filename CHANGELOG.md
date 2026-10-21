@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/) —
 with the pre-1.0 caveat that minor version bumps may carry breaking changes
 (protocol/metric shape changes), called out explicitly below.
 
+## [0.6.5](https://github.com/CharlieSu/unifand/compare/v0.6.4...v0.6.5) (2026-10-21)
+
+
+### Bug Fixes
+
+* **deps:** update rust docker tag to v1.99.0 ([#52](https://github.com/CharlieSu/unifand/issues/52)) ([537a688](https://github.com/CharlieSu/unifand/commit/537a6881c8687e6dd99858cc0e6f63472b1f038f))
+
 ## [0.6.4](https://github.com/CharlieSu/unifand/compare/v0.6.3...v0.6.4) (2026-09-09)
 
 
