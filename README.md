@@ -34,6 +34,11 @@ the hardware, and the responsibility for what ships are mine.
 - **GPU-led fan curve** — control temperature is `max(gpu, cpu - offset)`:
   GPU temp via NVML, CPU temp via the `k10temp` hwmon sensor. Piecewise-linear
   curve, hysteresis, and slew-limited ramps so fans never flutter or lurch.
+- **Multi-GPU aware** — every NVML device is read each tick and the fans
+  follow the worst case across cards (hottest die, least thermal headroom,
+  the card nearest its own power limit). Cards are probed individually, so
+  mixed models work, and each one gets its own `unifand_gpu_device_*`
+  metrics. One card behaves exactly as before.
 - **Multi-signal fusion** (opt-in) — fans can also follow GPU power draw
   (which leads temperature), thermal headroom to the card's own limit, and
   the GPU's throttle status, fused raise-only: any signal can raise duty
@@ -243,13 +248,14 @@ in both overlays) or the daemon silently never schedules.
 ## CLI
 
 ```
-unifand [--config PATH] [--oneshot]
+unifand [--config PATH] [--oneshot] [--probe-gpu]
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--config PATH` | `/etc/unifand/config.toml` | Config file to load |
 | `--oneshot` | off | Read sensors, print the control decision, exit. **Never touches the hub.** |
+| `--probe-gpu` | off | Print what NVML reports for every GPU (one `# gpu N` block per card: power, limits, thresholds, throttle reasons), exit. Use it to see which signals a card actually exposes. |
 
 `--oneshot` loads and validates the config (identical to normal startup —
 `Config::load` runs the same parse/validate path either way), discovers
@@ -418,6 +424,14 @@ LEDs to Near-limit.
 | `unifand_throttle_active` | `reason=sw_thermal\|hw_thermal\|hw_power_brake\|sw_power_cap` | NVML throttle reason currently asserted |
 | `unifand_throttle_floor_active` | — | 1 while the throttle floor is raising applied duty (including its hold window) |
 | `unifand_signal_errors_total` | `signal` (incl. `throttle`) | Real read failures per signal; `NotSupported` is not counted — it means the signal is absent |
+| `unifand_gpu_device_info` | `gpu`, `name`, `uuid` | Always 1, one series per GPU; join on `gpu` to label the per-card series below with the card's name. The `gpu` index is not stable across reboots — `uuid` is |
+| `unifand_gpu_device_temp_celsius` | `gpu` | Raw die temperature per GPU |
+| `unifand_gpu_device_power_watts` | `gpu` | Raw power draw per GPU |
+| `unifand_gpu_device_power_limit_watts` | `gpu` | Enforced power limit per GPU |
+| `unifand_gpu_device_thermal_margin_celsius` | `gpu` | Headroom to each GPU's own thermal limit |
+| `unifand_gpu_device_mem_temp_celsius` | `gpu` | Memory junction temperature, only for GPUs where NVML exposes it |
+| `unifand_gpu_device_throttle_active` | `gpu`, `reason` | NVML throttle reason currently asserted, per GPU |
+| `unifand_gpu_device_read_errors_total` | `gpu` | Ticks on which a real NVML read failed for this GPU |
 | `unifand_last_tick_timestamp_seconds` | — | Unix time the control loop last completed a tick; backs `/healthz` |
 | `unifand_build_info` | `version` | Always 1; join on `version` to identify the running build |
 
@@ -429,6 +443,23 @@ reads 0 in legacy mode), and an absent signal emits **no** series (no
 wholesale each tick and describe the latest tick only, so a signal that
 goes away disappears from the scrape rather than lingering at its last
 value.
+
+The `unifand_gpu_device_*` families render in both modes whenever a GPU is
+present, one series per card, and are raw (unsmoothed) NVML readings. Like
+the fusion families they are replaced each tick: a signal a card doesn't
+expose emits no series for that card, and a card that drops off the bus
+disappears from the scrape (its `read_errors_total` counter remains).
+
+With more than one GPU, every pre-existing GPU series is the **worst case
+across cards**, because that is what drives the fans:
+`unifand_temp_celsius{source="gpu"}` is the hottest card, the
+`thermal_margin` signal the smallest headroom, `mem_temp` the hottest card
+that reports it, and `unifand_throttle_active` is set if any card asserts
+the reason. The `gpu_power` signal and `unifand_gpu_power_limit_watts`
+follow one card at a time — with `unit = "percent_tdp"` the card at the
+highest fraction of its own enforced limit, with `unit = "watts"` the card
+drawing the most — so a `percent_tdp` curve stays correct across cards
+with different limits. Power is never summed across cards.
 
 `/healthz` (same port as `/metrics`) returns 200 while `now - unifand_last_tick_timestamp_seconds <= 3 * poll_interval_secs`, else 500 — this is what the DaemonSet's livenessProbe checks, so a wedged control loop (not just an unreachable metrics port) gets restarted.
 
