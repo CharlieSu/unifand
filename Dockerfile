@@ -8,7 +8,7 @@
 # which silently rolls to whatever Debian is current stable and could drift
 # ahead of the distroless runtime's glibc below). Deliberately no version
 # number in this comment: Renovate updates the FROM line, never the prose.
-FROM --platform=$BUILDPLATFORM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS builder
+FROM --platform=$BUILDPLATFORM rust:1.99.1-slim-trixie@sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb AS builder
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
 WORKDIR /app
