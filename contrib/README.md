@@ -26,7 +26,11 @@ candidate duty overlaid (shows which signal is winning), the
 power against its enforced limit, throttle-reason bits with the duty
 floor, and per-signal read-error rates. The fusion panels are simply
 empty on a daemon running with `[signals]` disabled — those series aren't
-emitted at all. It carries an `__inputs` block for a
+emitted at all. A per-card GPU row follows: die and memory temperature,
+power against each card's own enforced limit, thermal margin, throttle
+bits and read-error rate by `gpu`, plus a table mapping each `gpu` index
+to its name and UUID. Those panels fill in both control modes whenever a
+GPU is present, and show one series per card on a multi-GPU node. It carries an `__inputs` block for a
 `${DS_PROMETHEUS}` datasource variable, so Grafana's import flow will prompt
 you to pick a datasource rather than assuming a "default" one exists.
 
@@ -104,12 +108,16 @@ shape prometheus-operator's `PrometheusRule`, the VictoriaMetrics
 operator's `VMRule`, and standalone Prometheus `rule_files:` all accept.
 The file's header comment shows how to wrap it in either CRD envelope.
 
-Nine rules: `UnifandAbsent` (scrape target gone), `UnifandStuck` (control
+Ten rules: `UnifandAbsent` (scrape target gone), `UnifandStuck` (control
 loop wedged — the same signal `/healthz` uses), `UnifandHubMissing` (no SL
 V2 hub found), `UnifandDegraded` (running CPU-only), `UnifandFallbackActive`
 (all sensors lost — the single most important one to page on),
 `UnifandHidWriteErrors` (duty writes failing), `UnifandFanStalled`
-(commanded duty but near-zero RPM), and two that only fire on a daemon
+(commanded duty but near-zero RPM), `UnifandGpuReadErrors`
+(`unifand_gpu_device_read_errors_total` increasing — NVML reads for one
+card are failing; on a multi-GPU node this is the only alert for a card
+the fans can no longer see, since `UnifandDegraded` stays quiet while
+another card still answers), and two that only fire on a daemon
 running with `[signals]` enabled: `UnifandThermalThrottle` (a thermal
 throttle bit held for minutes — never observed in normal operation, so
 treat it as cooling genuinely failing; `sw_power_cap` is deliberately not
