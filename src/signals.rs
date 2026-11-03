@@ -97,6 +97,102 @@ impl ThrottleFlags {
     }
 }
 
+/// One card's raw (unfiltered) readings for one tick, before the cards are
+/// folded into a single `SignalReadings` by `aggregate_gpus`. Also what the
+/// per-card `unifand_gpu_device_*` metrics publish, so a multi-GPU box stays
+/// observable card by card even though the fans follow the worst case.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GpuReading {
+    /// NVML device index. Not guaranteed stable across reboots or driver
+    /// reloads — `uuid` is the durable identity.
+    pub index: u32,
+    pub name: String,
+    pub uuid: String,
+    /// Die temperature. `None` only on a real read failure: every NVML
+    /// device supports it.
+    pub temp_c: Option<f64>,
+    pub power_w: Option<f64>,
+    pub power_limit_w: Option<f64>,
+    pub thermal_margin_c: Option<f64>,
+    pub mem_temp_c: Option<f64>,
+    /// `None` when the card doesn't report throttle reasons (or the read
+    /// failed), as distinct from "reports them, none asserted".
+    pub throttle: Option<ThrottleFlags>,
+    /// A real (non-`NotSupported`) read failure on this card this tick.
+    pub read_error: bool,
+}
+
+/// Hottest raw die temperature across all cards — the legacy control
+/// path's GPU temperature. `None` when no card produced a reading.
+pub fn hottest_gpu_c(gpus: &[GpuReading]) -> Option<f64> {
+    gpus.iter().filter_map(|g| g.temp_c).reduce(f64::max)
+}
+
+/// Folds per-card readings into the single worst-case `SignalReadings` the
+/// fusion pipeline consumes, so one card behaves exactly as it always has
+/// and N cards drive the fans from whichever is working hardest:
+/// hottest die and memory temperature, smallest thermal margin (each card
+/// measured against its own limit), any card's throttle bit.
+///
+/// Power picks ONE card and reports its watts and limit together, never a
+/// sum: in `percent_tdp` the card at the highest fraction of its own
+/// enforced limit (so a 575 W and a 600 W card both read 100% flat out and
+/// one curve fits both), in `watts` the card drawing the most.
+///
+/// Each value is plausibility-checked per card BEFORE the fold. Checked
+/// after, one card's sentinel (a 0 threshold turning into a hugely negative
+/// margin, say) would win the min/max, be rejected downstream, and take the
+/// healthy card's signal down with it.
+pub fn aggregate_gpus(gpus: &[GpuReading], power_unit: PowerUnit) -> SignalReadings {
+    let worst =
+        |kind: SignalKind, pick: fn(&GpuReading) -> Option<f64>, fold: fn(f64, f64) -> f64| {
+            gpus.iter()
+                .filter_map(pick)
+                .filter(|&v| plausible(kind, v))
+                .reduce(fold)
+        };
+
+    // (watts, limit) per card with a plausible power reading.
+    let powered: Vec<(f64, Option<f64>)> = gpus
+        .iter()
+        .filter_map(|g| {
+            let w = g.power_w.filter(|&w| plausible(SignalKind::GpuPower, w))?;
+            Some((w, g.power_limit_w))
+        })
+        .collect();
+    let most_watts = || powered.iter().copied().max_by(|a, b| a.0.total_cmp(&b.0));
+    let power = match power_unit {
+        PowerUnit::Watts => most_watts(),
+        // Only cards with a usable limit have a percentage to compete on.
+        // If none does, pass the highest draw through with its (unusable)
+        // limit and let `fuse` skip the signal, as it does for one card.
+        PowerUnit::PercentTdp => powered
+            .iter()
+            .filter_map(|&(w, limit)| limit.filter(|&l| l > 0.0).map(|l| (w, l)))
+            .max_by(|a, b| (a.0 / a.1).total_cmp(&(b.0 / b.1)))
+            .map(|(w, l)| (w, Some(l)))
+            .or_else(most_watts),
+    };
+
+    let mut throttle = ThrottleFlags::default();
+    for t in gpus.iter().filter_map(|g| g.throttle) {
+        throttle.sw_thermal |= t.sw_thermal;
+        throttle.hw_thermal |= t.hw_thermal;
+        throttle.hw_power_brake |= t.hw_power_brake;
+        throttle.sw_power_cap |= t.sw_power_cap;
+    }
+
+    SignalReadings {
+        gpu_temp_c: worst(SignalKind::GpuTemp, |g| g.temp_c, f64::max),
+        cpu_temp_c: None,
+        gpu_power_w: power.map(|(w, _)| w),
+        gpu_power_limit_w: power.and_then(|(_, limit)| limit),
+        thermal_margin_c: worst(SignalKind::ThermalMargin, |g| g.thermal_margin_c, f64::min),
+        mem_temp_c: worst(SignalKind::MemTemp, |g| g.mem_temp_c, f64::max),
+        throttle,
+    }
+}
+
 /// Plausibility guard: rejects non-finite values and values outside a
 /// physically sane range for the signal's kind.
 ///
@@ -922,5 +1018,232 @@ mod tests {
         assert!(latch.update(true, 1));
         assert!(latch.update(false, 5)); // 5s remain of the 10s hold
         assert!(!latch.update(false, 10)); // hold expired
+    }
+
+    // -- multi-GPU aggregation -------------------------------------------
+
+    fn card(index: u32) -> GpuReading {
+        GpuReading {
+            index,
+            ..GpuReading::default()
+        }
+    }
+
+    #[test]
+    fn hottest_gpu_takes_max_and_skips_failed_cards() {
+        let gpus = [
+            GpuReading {
+                temp_c: Some(55.0),
+                ..card(0)
+            },
+            GpuReading {
+                temp_c: None,
+                ..card(1)
+            },
+            GpuReading {
+                temp_c: Some(81.0),
+                ..card(2)
+            },
+        ];
+        assert_eq!(hottest_gpu_c(&gpus), Some(81.0));
+        assert_eq!(hottest_gpu_c(&[card(0)]), None);
+        assert_eq!(hottest_gpu_c(&[]), None);
+    }
+
+    #[test]
+    fn aggregate_single_card_passes_readings_through() {
+        let flags = ThrottleFlags {
+            sw_power_cap: true,
+            ..ThrottleFlags::default()
+        };
+        let only = GpuReading {
+            temp_c: Some(71.0),
+            power_w: Some(412.5),
+            power_limit_w: Some(575.0),
+            thermal_margin_c: Some(19.0),
+            mem_temp_c: Some(88.0),
+            throttle: Some(flags),
+            ..card(0)
+        };
+        for unit in [PowerUnit::Watts, PowerUnit::PercentTdp] {
+            assert_eq!(
+                aggregate_gpus(std::slice::from_ref(&only), unit),
+                SignalReadings {
+                    gpu_temp_c: Some(71.0),
+                    cpu_temp_c: None,
+                    gpu_power_w: Some(412.5),
+                    gpu_power_limit_w: Some(575.0),
+                    thermal_margin_c: Some(19.0),
+                    mem_temp_c: Some(88.0),
+                    throttle: flags,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_takes_worst_case_per_signal_across_cards() {
+        // Each worst case deliberately comes from a different card.
+        let gpus = [
+            GpuReading {
+                temp_c: Some(80.0),
+                thermal_margin_c: Some(10.0),
+                mem_temp_c: Some(70.0),
+                ..card(0)
+            },
+            GpuReading {
+                temp_c: Some(60.0),
+                thermal_margin_c: Some(35.0),
+                mem_temp_c: Some(96.0),
+                ..card(1)
+            },
+        ];
+        let agg = aggregate_gpus(&gpus, PowerUnit::Watts);
+        assert_eq!(agg.gpu_temp_c, Some(80.0));
+        assert_eq!(agg.thermal_margin_c, Some(10.0));
+        assert_eq!(agg.mem_temp_c, Some(96.0));
+    }
+
+    #[test]
+    fn aggregate_skips_signals_a_card_does_not_expose() {
+        // Mixed capabilities: only card 1 reports memory temperature and
+        // only card 0 reports a margin. Neither absence may blank the
+        // other card's signal.
+        let gpus = [
+            GpuReading {
+                temp_c: Some(70.0),
+                thermal_margin_c: Some(20.0),
+                ..card(0)
+            },
+            GpuReading {
+                temp_c: Some(65.0),
+                mem_temp_c: Some(90.0),
+                ..card(1)
+            },
+        ];
+        let agg = aggregate_gpus(&gpus, PowerUnit::Watts);
+        assert_eq!(agg.thermal_margin_c, Some(20.0));
+        assert_eq!(agg.mem_temp_c, Some(90.0));
+    }
+
+    #[test]
+    fn aggregate_ors_throttle_flags_across_cards() {
+        let gpus = [
+            GpuReading {
+                throttle: Some(ThrottleFlags {
+                    sw_thermal: true,
+                    ..ThrottleFlags::default()
+                }),
+                ..card(0)
+            },
+            GpuReading {
+                throttle: None,
+                ..card(1)
+            },
+            GpuReading {
+                throttle: Some(ThrottleFlags {
+                    hw_power_brake: true,
+                    ..ThrottleFlags::default()
+                }),
+                ..card(2)
+            },
+        ];
+        assert_eq!(
+            aggregate_gpus(&gpus, PowerUnit::Watts).throttle,
+            ThrottleFlags {
+                sw_thermal: true,
+                hw_thermal: false,
+                hw_power_brake: true,
+                sw_power_cap: false,
+            }
+        );
+    }
+
+    /// 500 W of 575 W (87%) beside 510 W of 600 W (85%): the two units
+    /// disagree about which card is working harder.
+    fn mismatched_power_cards() -> [GpuReading; 2] {
+        [
+            GpuReading {
+                power_w: Some(500.0),
+                power_limit_w: Some(575.0),
+                ..card(0)
+            },
+            GpuReading {
+                power_w: Some(510.0),
+                power_limit_w: Some(600.0),
+                ..card(1)
+            },
+        ]
+    }
+
+    #[test]
+    fn aggregate_percent_tdp_picks_card_nearest_its_own_limit() {
+        let agg = aggregate_gpus(&mismatched_power_cards(), PowerUnit::PercentTdp);
+        assert_eq!(agg.gpu_power_w, Some(500.0));
+        assert_eq!(agg.gpu_power_limit_w, Some(575.0));
+    }
+
+    #[test]
+    fn aggregate_watts_picks_card_drawing_the_most() {
+        let agg = aggregate_gpus(&mismatched_power_cards(), PowerUnit::Watts);
+        assert_eq!(agg.gpu_power_w, Some(510.0));
+        assert_eq!(agg.gpu_power_limit_w, Some(600.0));
+    }
+
+    #[test]
+    fn aggregate_percent_tdp_ignores_a_card_with_no_limit() {
+        // A card with no known limit has no percentage; it must not
+        // displace one that does, however many watts it draws.
+        let gpus = [
+            GpuReading {
+                power_w: Some(590.0),
+                power_limit_w: None,
+                ..card(0)
+            },
+            GpuReading {
+                power_w: Some(300.0),
+                power_limit_w: Some(600.0),
+                ..card(1)
+            },
+        ];
+        let agg = aggregate_gpus(&gpus, PowerUnit::PercentTdp);
+        assert_eq!(agg.gpu_power_w, Some(300.0));
+        assert_eq!(agg.gpu_power_limit_w, Some(600.0));
+    }
+
+    #[test]
+    fn aggregate_drops_one_cards_implausible_value_not_the_whole_signal() {
+        // Card 1 returns sentinels: a margin computed from a 0 threshold,
+        // a 0 W power reading and an absurd die temperature. Each must be
+        // discarded per card so card 0's real values survive.
+        let gpus = [
+            GpuReading {
+                temp_c: Some(72.0),
+                power_w: Some(400.0),
+                power_limit_w: Some(575.0),
+                thermal_margin_c: Some(18.0),
+                ..card(0)
+            },
+            GpuReading {
+                temp_c: Some(500.0),
+                power_w: Some(0.0),
+                power_limit_w: Some(600.0),
+                thermal_margin_c: Some(-60.0),
+                ..card(1)
+            },
+        ];
+        let agg = aggregate_gpus(&gpus, PowerUnit::PercentTdp);
+        assert_eq!(agg.gpu_temp_c, Some(72.0));
+        assert_eq!(agg.thermal_margin_c, Some(18.0));
+        assert_eq!(agg.gpu_power_w, Some(400.0));
+        assert_eq!(agg.gpu_power_limit_w, Some(575.0));
+    }
+
+    #[test]
+    fn aggregate_of_no_cards_is_empty() {
+        assert_eq!(
+            aggregate_gpus(&[], PowerUnit::PercentTdp),
+            SignalReadings::default()
+        );
     }
 }

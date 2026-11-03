@@ -52,7 +52,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "graphTooltip": 1,
   "refresh": "30s",
@@ -1018,6 +1018,311 @@
         }
       ],
       "description": "Real per-signal read failures (NotSupported is not counted \u2014 it means the signal is absent, which is normal). A sustained nonzero rate means a sensor that should work is failing repeatedly. The 'throttle' series covers the throttle-reason read that feeds the floor and the alarm ladder."
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "GPU Read Error Rate (by card)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 50,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max by (node, gpu) (rate(unifand_gpu_device_read_errors_total[5m]))",
+          "refId": "A",
+          "legendFormat": "gpu {{gpu}}"
+        }
+      ],
+      "description": "Ticks per second on which a real NVML read failed for each card (NotSupported is not counted). On a multi-GPU node a failing card does not set unifand_degraded while another card still answers, so this is where a card the fans can no longer see shows up."
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "GPU Temperature (by card)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 58,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "spanNulls": false
+          },
+          "unit": "celsius"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max by (node, gpu) (unifand_gpu_device_temp_celsius)",
+          "refId": "A",
+          "legendFormat": "gpu {{gpu}} die"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max by (node, gpu) (unifand_gpu_device_mem_temp_celsius)",
+          "refId": "B",
+          "legendFormat": "gpu {{gpu}} memory"
+        }
+      ],
+      "description": "Raw die temperature per card, plus memory junction temperature for cards where NVML exposes it. The fans follow the hottest card; unifand_temp_celsius{source=\"gpu\"} in the Temperatures panel is that maximum."
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "GPU Power vs Enforced Limit (by card)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 58,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "spanNulls": false
+          },
+          "unit": "watt"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max by (node, gpu) (unifand_gpu_device_power_watts)",
+          "refId": "A",
+          "legendFormat": "gpu {{gpu}} power"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max by (node, gpu) (unifand_gpu_device_power_limit_watts)",
+          "refId": "B",
+          "legendFormat": "gpu {{gpu}} limit"
+        }
+      ],
+      "description": "Raw (unsmoothed) power draw per card against that card's own enforced limit. Rendered whether or not [signals] is enabled. With several cards the gpu_power signal follows one of them at a time: the card nearest its own limit (percent_tdp) or drawing the most (watts)."
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "GPU Thermal Margin (by card)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 66,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "spanNulls": false
+          },
+          "unit": "celsius"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max by (node, gpu) (unifand_gpu_device_thermal_margin_celsius)",
+          "refId": "A",
+          "legendFormat": "gpu {{gpu}}"
+        }
+      ],
+      "description": "Headroom in \u00b0C to each card's own thermal limit. The thermal_margin signal follows the card with the least headroom."
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "GPU Throttle State (by card and reason)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 66,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max by (node, gpu, reason) (unifand_gpu_device_throttle_active)",
+          "refId": "A",
+          "legendFormat": "gpu {{gpu}} {{reason}}"
+        }
+      ],
+      "description": "NVML throttle-reason bits per card. sw_power_cap asserting under sustained load is normal; the thermal bits are not."
+    },
+    {
+      "id": 22,
+      "type": "table",
+      "title": "GPU Devices",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 74,
+        "w": 24,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max by (node, gpu, name, uuid) (unifand_gpu_device_info)",
+          "refId": "A",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "description": "unifand_gpu_device_info is always 1, one row per card. The gpu index labels the per-card panels above but is not stable across reboots or driver reloads; the uuid is."
     }
   ]
 }

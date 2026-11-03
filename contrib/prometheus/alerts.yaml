@@ -30,6 +30,8 @@
 # verified against src/metrics.rs on the feat/multi-signal branch:
 # unifand_throttle_active{reason="sw_thermal"|"hw_thermal"|"hw_power_brake"|"sw_power_cap"},
 # unifand_signal_errors_total{signal}.
+# Per-card GPU metrics (emitted whenever a GPU is present, in both modes):
+# unifand_gpu_device_read_errors_total{gpu}.
 groups:
   - name: unifand
     rules:
@@ -198,3 +200,25 @@ groups:
             stops producing a candidate duty and the remaining signals
             keep control), but the daemon is flying with one less input;
             check NVML/driver health on the node.
+
+      # Per-card NVML read failures. On a multi-GPU node this is the only
+      # signal for a card the daemon can no longer read: UnifandDegraded
+      # stays quiet as long as one card still supplies a temperature, and
+      # the fans simply follow the cards that answer. Emitted in both
+      # control modes. NotSupported is never counted.
+      - alert: UnifandGpuReadErrors
+        expr: rate(unifand_gpu_device_read_errors_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "unifand cannot read GPU {{ $labels.gpu }} on {{ $labels.instance }}"
+          description: >-
+            unifand_gpu_device_read_errors_total{gpu="{{ $labels.gpu }}"}
+            has been increasing for 10 minutes: NVML reads for this card
+            are failing repeatedly. If its temperature read is the one
+            failing, the card is not contributing to fan control at all —
+            on a multi-GPU node the fans are following the other cards
+            only. The daemon retries NVML discovery about once a minute;
+            check driver health and `nvidia-smi` on the node (a card that
+            has fallen off the bus shows up here first).
