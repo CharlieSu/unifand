@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/) —
 with the pre-1.0 caveat that minor version bumps may carry breaking changes
 (protocol/metric shape changes), called out explicitly below.
 
+## [0.6.6](https://github.com/CharlieSu/unifand/compare/v0.6.5...v0.6.6) (2026-11-05)
+
+
+### Bug Fixes
+
+* **deps:** update rust docker tag to v1.99.1 ([#60](https://github.com/CharlieSu/unifand/issues/60)) ([be04c9a](https://github.com/CharlieSu/unifand/commit/be04c9a657c9781364cb87de8db844c46202fd2a))
+* **deps:** update rust:1.99.1-slim-trixie docker digest to b8e062b ([#62](https://github.com/CharlieSu/unifand/issues/62)) ([a32b563](https://github.com/CharlieSu/unifand/commit/a32b563705e7926fdeb8609e2e8951bbcf4c7167))
+
 ## [0.6.5](https://github.com/CharlieSu/unifand/compare/v0.6.4...v0.6.5) (2026-10-21)
 
 
