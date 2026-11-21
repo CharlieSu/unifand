@@ -30,6 +30,12 @@ struct State {
     throttle: Option<ThrottleFlags>,
     throttle_floor_active: bool,
     signal_errors: BTreeMap<&'static str, u64>,
+
+    // Fan self-test. Populated only on settled full-tilt observations /
+    // while the feature is enabled, so both render conditionally (absent
+    // until first set), matching the `signal_values` precedent above.
+    full_rpm: BTreeMap<u8, (u16, u64)>,
+    selftest_running: Option<bool>,
 }
 
 pub struct Metrics {
@@ -187,6 +193,20 @@ impl Metrics {
         *self.state().signal_errors.entry("throttle").or_insert(0) += 1;
     }
 
+    /// RPM last measured with this channel settled at 100% duty, with the
+    /// Unix time of that measurement. Insert-only: a channel that stops
+    /// being measured keeps its last full-tilt reading on display.
+    #[allow(dead_code)] // wired into the tick loop by the self-test feature
+    pub fn set_full_rpm(&self, ch: u8, rpm: u16, unix_secs: u64) {
+        self.state().full_rpm.insert(ch, (rpm, unix_secs));
+    }
+    /// 1 while a self-test sweep is holding fans at 100%. Rendered only
+    /// once set — its presence tells alert rules `[selftest]` is enabled.
+    #[allow(dead_code)] // wired into the tick loop by the self-test feature
+    pub fn set_selftest_running(&self, v: bool) {
+        self.state().selftest_running = Some(v);
+    }
+
     fn healthz(&self) -> bool {
         let last_tick = self.state().last_tick;
         healthz_ok(now_unix_secs(), last_tick, self.poll_interval_secs)
@@ -214,6 +234,32 @@ impl Metrics {
         );
         for (ch, v) in &s.rpm {
             out.push_str(&format!("unifand_fan_rpm{{channel=\"{}\"}} {}\n", ch, v));
+        }
+        if !s.full_rpm.is_empty() {
+            out.push_str(
+                "# HELP unifand_full_rpm Fan speed last measured with the channel settled at 100% duty.\n# TYPE unifand_full_rpm gauge\n",
+            );
+            for (ch, (rpm, _)) in &s.full_rpm {
+                out.push_str(&format!("unifand_full_rpm{{channel=\"{}\"}} {}\n", ch, rpm));
+            }
+            out.push_str(
+                "# HELP unifand_full_rpm_timestamp_seconds Unix time of the unifand_full_rpm measurement.\n# TYPE unifand_full_rpm_timestamp_seconds gauge\n",
+            );
+            for (ch, (_, ts)) in &s.full_rpm {
+                out.push_str(&format!(
+                    "unifand_full_rpm_timestamp_seconds{{channel=\"{}\"}} {}\n",
+                    ch, ts
+                ));
+            }
+        }
+        if let Some(running) = s.selftest_running {
+            out.push_str(
+                "# HELP unifand_selftest_running 1 while a self-test sweep is holding fans at 100%. Present only when [selftest] is enabled.\n# TYPE unifand_selftest_running gauge\n",
+            );
+            out.push_str(&format!(
+                "unifand_selftest_running {}\n",
+                if running { 1 } else { 0 }
+            ));
         }
         out.push_str("# HELP unifand_degraded 1 when GPU sensor unavailable.\n# TYPE unifand_degraded gauge\n");
         out.push_str(&format!(
@@ -675,5 +721,36 @@ mod tests {
         // here so "strictly additive plus this one line" stays a deliberate,
         // reviewed choice rather than drift.
         assert!(out.contains("unifand_throttle_floor_active 0"));
+    }
+
+    #[test]
+    fn full_rpm_and_selftest_series_absent_until_set() {
+        let m = Metrics::new(5);
+        let out = m.render();
+        assert!(!out.contains("unifand_full_rpm"));
+        assert!(!out.contains("unifand_selftest_running"));
+    }
+
+    #[test]
+    fn full_rpm_renders_value_and_timestamp_per_channel() {
+        let m = Metrics::new(5);
+        m.set_full_rpm(1, 1995, 1_800_000_000);
+        m.set_full_rpm(2, 1720, 1_800_000_005);
+        let out = m.render();
+        assert!(out.contains("# TYPE unifand_full_rpm gauge"));
+        assert!(out.contains("unifand_full_rpm{channel=\"1\"} 1995\n"));
+        assert!(out.contains("unifand_full_rpm{channel=\"2\"} 1720\n"));
+        assert!(out.contains("# TYPE unifand_full_rpm_timestamp_seconds gauge"));
+        assert!(out.contains("unifand_full_rpm_timestamp_seconds{channel=\"1\"} 1800000000\n"));
+        assert!(out.contains("unifand_full_rpm_timestamp_seconds{channel=\"2\"} 1800000005\n"));
+    }
+
+    #[test]
+    fn selftest_running_renders_0_and_1_once_set() {
+        let m = Metrics::new(5);
+        m.set_selftest_running(false);
+        assert!(m.render().contains("unifand_selftest_running 0\n"));
+        m.set_selftest_running(true);
+        assert!(m.render().contains("unifand_selftest_running 1\n"));
     }
 }
