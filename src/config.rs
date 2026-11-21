@@ -285,6 +285,31 @@ impl Default for ThrottleConfig {
     }
 }
 
+/// `[selftest]` section: fan self-test (full-tilt RPM observation). Passive
+/// recording of each channel's settled 100%-duty RPM is always on; the
+/// periodic sweep driving fans to 100% is gated on `enabled`.
+pub const SELFTEST_SETTLE_SECS: u64 = 10;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SelftestConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "d_selftest_stale_after_h")]
+    pub stale_after_h: u64,
+    #[serde(default = "d_selftest_duration_secs")]
+    pub duration_secs: u64,
+}
+
+impl Default for SelftestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stale_after_h: d_selftest_stale_after_h(),
+            duration_secs: d_selftest_duration_secs(),
+        }
+    }
+}
+
 /// `[signals]` section: multi-signal fan-curve fusion (GPU power, thermal
 /// margin, throttle floor), gated behind `enabled` — inert unless turned on,
 /// mirroring `[rgb]`.
@@ -330,6 +355,8 @@ pub struct Config {
     pub rgb: RgbConfig,
     #[serde(default)]
     pub signals: SignalsConfig,
+    #[serde(default)]
+    pub selftest: SelftestConfig,
 }
 
 fn d_sustained_hot_c() -> f64 {
@@ -395,6 +422,12 @@ fn d_rgb_buckets() -> u8 {
 }
 fn d_true() -> bool {
     true
+}
+fn d_selftest_stale_after_h() -> u64 {
+    24
+}
+fn d_selftest_duration_secs() -> u64 {
+    30
 }
 fn d_signal_alpha_one() -> f64 {
     1.0
@@ -730,6 +763,23 @@ impl Config {
                         s.throttle.hold_secs
                     );
                 }
+            }
+        }
+        if self.selftest.enabled {
+            if self.selftest.stale_after_h == 0 {
+                bail!("selftest.stale_after_h must be at least 1");
+            }
+            if self.selftest.duration_secs < SELFTEST_SETTLE_SECS + 2 * self.poll_interval_secs {
+                bail!(
+                    "selftest.duration_secs {} must be at least settle {}s plus two poll intervals ({}s = {}s) so a settled measurement can be taken",
+                    self.selftest.duration_secs,
+                    SELFTEST_SETTLE_SECS,
+                    self.poll_interval_secs,
+                    SELFTEST_SETTLE_SECS + 2 * self.poll_interval_secs
+                );
+            }
+            if self.selftest.duration_secs > 600 {
+                bail!("selftest.duration_secs exceeds 600");
             }
         }
         Ok(())
@@ -1245,6 +1295,63 @@ duty = 100
         // because cpu_temp itself is disabled.
         let s = "[[curve]]\ntemp = 40.0\nduty = 50\n[signals]\nenabled = true\n[signals.cpu_temp]\nenabled = false\noffset_c = -5.0\nalpha = 5.0\n";
         assert!(Config::from_str(s).is_ok());
+    }
+
+    // -- [selftest] ---------------------------------------------------------
+
+    const ONE_POINT: &str = "[[curve]]\ntemp = 40.0\nduty = 50\n";
+
+    #[test]
+    fn selftest_defaults_when_section_absent() {
+        let c = Config::from_str(ONE_POINT).unwrap();
+        assert!(!c.selftest.enabled);
+        assert_eq!(c.selftest.stale_after_h, 24);
+        assert_eq!(c.selftest.duration_secs, 30);
+    }
+
+    #[test]
+    fn selftest_section_parses() {
+        let s = format!(
+            "{ONE_POINT}[selftest]\nenabled = true\nstale_after_h = 6\nduration_secs = 40\n"
+        );
+        let c = Config::from_str(&s).unwrap();
+        assert!(c.selftest.enabled);
+        assert_eq!(c.selftest.stale_after_h, 6);
+        assert_eq!(c.selftest.duration_secs, 40);
+    }
+
+    #[test]
+    fn selftest_rejects_zero_stale_after() {
+        let s = format!("{ONE_POINT}[selftest]\nenabled = true\nstale_after_h = 0\n");
+        assert!(Config::from_str(&s).is_err());
+    }
+
+    #[test]
+    fn selftest_rejects_duration_too_short_for_poll_interval() {
+        // settle 10 + 2 * 60 = 130 > 30
+        let s = format!("poll_interval_secs = 60\n{ONE_POINT}[selftest]\nenabled = true\n");
+        assert!(Config::from_str(&s).is_err());
+    }
+
+    #[test]
+    fn selftest_rejects_duration_over_600() {
+        let s = format!("{ONE_POINT}[selftest]\nenabled = true\nduration_secs = 601\n");
+        assert!(Config::from_str(&s).is_err());
+    }
+
+    #[test]
+    fn selftest_invalid_values_ignored_when_disabled() {
+        let s = format!(
+            "{ONE_POINT}[selftest]\nenabled = false\nstale_after_h = 0\nduration_secs = 1\n"
+        );
+        assert!(Config::from_str(&s).is_ok());
+    }
+
+    #[test]
+    fn selftest_unknown_key_is_collected_not_rejected() {
+        let s = format!("{ONE_POINT}[selftest]\nduty = 100\n");
+        let (_, ignored) = Config::parse_with_ignored(&s).unwrap();
+        assert_eq!(ignored, vec!["selftest.duty".to_string()]);
     }
 
     #[test]

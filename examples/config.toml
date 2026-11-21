@@ -194,3 +194,12 @@ enabled = false
 floor_duty = 85
 hold_secs = 30
 reasons = ["sw_thermal", "hw_thermal", "hw_power_brake"]
+
+# Fan self-test (off by default). When enabled, fans are driven to 100% for
+# duration_secs whenever no channel has been measured at full duty for
+# stale_after_h. The measurement itself (unifand_full_rpm) is recorded
+# whenever fans hold 100%, with or without this section.
+# [selftest]
+# enabled = true
+# stale_after_h = 24
+# duration_secs = 30

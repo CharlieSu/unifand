@@ -200,6 +200,32 @@ mod tests {
         assert_eq!(ctl.decide(&c(), 45.0), Some(50));
     }
 
+    #[test]
+    fn force_100_then_decide_ramps_down_slew_limited() {
+        let mut ctl = Controller::new(2.0, 5, 10);
+        ctl.decide(&c(), 35.0); // idle at 30, last_temp = 35
+        ctl.force(100);
+        // Temperature has not moved; the 70-point gap alone must drive the ramp.
+        assert_eq!(ctl.decide(&c(), 35.0), Some(90));
+        assert_eq!(ctl.decide(&c(), 35.0), Some(80));
+    }
+
+    #[test]
+    fn force_100_then_decide_target_ramps_down_slew_limited() {
+        let mut ctl = Controller::new(2.0, 5, 10);
+        ctl.decide_target(30);
+        ctl.force(100);
+        assert_eq!(ctl.decide_target(30), Some(90));
+    }
+
+    #[test]
+    fn force_100_holds_when_target_is_within_min_duty_delta() {
+        let mut ctl = Controller::new(2.0, 5, 10);
+        ctl.decide_target(97);
+        ctl.force(100);
+        assert_eq!(ctl.decide_target(97), None); // fans stay at 100: safe side
+    }
+
     // -- decide_target / step_toward ---------------------------------------
 
     #[test]

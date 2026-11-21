@@ -48,6 +48,11 @@ the hardware, and the responsibility for what ships are mine.
   distinct runway pattern when the daemon loses its sensors. All animations
   run on the hub itself — a whole thermal incident costs a handful of USB
   packets.
+- **Full-duty RPM health metric** — each channel's RPM, recorded whenever
+  the fans have settled at 100% duty, is a health signal: a fan that still
+  spins but can no longer reach full speed is caught. Optional periodic
+  self-test sweeps keep the measurement fresh on an idle node (see
+  "Fan self-test" below).
 - **Prometheus metrics** — temps, per-channel duty and rpm, degradation and
   error counters on `:9877`. Dashboard-ready.
 - **Fail-safe by design** — the invariant is *daemon-down must never mean
@@ -295,6 +300,9 @@ multi-signal starting point (measured curve knees, needs per-card tuning):
 | `[signals.thermal_margin]` | disabled | Inverted curve over headroom °C to the card's thermal limit; `alpha` 0.4 |
 | `[signals.mem_temp]` | disabled | Memory-junction-temp curve — NVML doesn't expose it on most consumer cards, so it ships off |
 | `[signals.throttle]` | disabled | Duty floor while the GPU reports a throttle `reasons` bit: `floor_duty` 85, `hold_secs` 30 |
+| `[selftest] enabled` | `false` | Opt-in periodic self-test: drive fans to 100% for `duration_secs` when no channel has a settled full-duty RPM measurement for `stale_after_h` |
+| `[selftest] stale_after_h` | 24 | Hours before a settled full-duty measurement is considered stale (≥ 1, validated only when enabled) |
+| `[selftest] duration_secs` | 30 | Sweep duration (≥ settle 10 s + 2× `poll_interval_secs`, and ≤ 600; validated only when enabled) |
 | `metrics.listen` | `0.0.0.0:9877` | Prometheus endpoint |
 
 ### Multi-signal fusion
@@ -398,6 +406,39 @@ throttle *floor* is enabled. Disabling `[signals.throttle]` turns off the
 duty floor, not the alarm: sustained thermal throttling still drives the
 LEDs to Near-limit.
 
+### Fan self-test
+
+**What it is for.** Fans fail slowly: on an idle node the fans sit at
+30% duty, and a worn bearing or obstruction that stops a fan from ever
+reaching full speed is invisible until a load spike arrives. The self-test
+records each channel's RPM at 100% duty as a health metric so that failure
+is catchable on a node that idles. It is not dust maintenance — nothing
+about it helps the GPU's own fan, which unifand does not control.
+
+**Passive recording is always on.** `unifand_full_rpm` is recorded whenever
+any channel holds exactly 100% duty for 10 s settled — e.g. under a
+sustained load that pins the curve at its top — with or without the
+`[selftest]` section. Only the *sweep* is opt-in.
+
+**When a sweep runs.** With `[selftest] enabled = true`, a sweep starts
+once no channel has a settled full-duty measurement for
+`stale_after_h` — counted from process start, so a freshly started daemon
+never sweeps immediately. Sweeps are never started during the sensor-loss
+fallback, and a sweep in progress is aborted the moment the fallback
+activates.
+
+**What you will notice.** The fans jump to 100% for `duration_secs` (30 s
+by default), then ramp down at `max_step_per_tick` per poll — about 35 s
+more at the defaults — roughly a minute of extra noise in total. The LED
+glow shows the 100% color while the sweep runs (the fans really are at
+100%). The alarm ladder is fed the curve's duty, not the sweep's, so the
+sweep itself never escalates the LEDs — but real thermal triggers still
+do.
+
+A measurement counts only after 10 s settled at exactly 100% (an earlier
+sample would be mid spin-up and read up to ~5% low). A sweep that records
+nothing (e.g. RPM reads kept failing) is retried after 1 h.
+
 ## Metrics
 
 | Metric | Labels | Meaning |
@@ -405,6 +446,8 @@ LEDs to Near-limit.
 | `unifand_temp_celsius` | `source=gpu\|cpu\|control` | Sensor and control temperatures |
 | `unifand_duty_percent` | `channel` | Last duty written |
 | `unifand_fan_rpm` | `channel` | Fan speed read back from the hub |
+| `unifand_full_rpm` | `channel` | Fan speed last measured with the channel settled at 100% duty — absent until the first such measurement |
+| `unifand_full_rpm_timestamp_seconds` | `channel` | Unix time of that full-duty measurement — absent until the first such measurement |
 | `unifand_degraded` | — | 1 when the GPU sensor is unavailable |
 | `unifand_fallback_active` | — | 1 when all sensors are lost and `fallback_duty` is being forced |
 | `unifand_hub_present` | — | 1 when the SL V2 hub is currently open and initialized (0 during startup hub-wait or a lost hub) |
@@ -418,6 +461,7 @@ LEDs to Near-limit.
 | `unifand_throttle_active` | `reason=sw_thermal\|hw_thermal\|hw_power_brake\|sw_power_cap` | NVML throttle reason currently asserted |
 | `unifand_throttle_floor_active` | — | 1 while the throttle floor is raising applied duty (including its hold window) |
 | `unifand_signal_errors_total` | `signal` (incl. `throttle`) | Real read failures per signal; `NotSupported` is not counted — it means the signal is absent |
+| `unifand_selftest_running` | — | 1 while a self-test sweep is holding fans at 100% — **present only when `[selftest]` is enabled** (its presence tells your rules the feature is on) |
 | `unifand_last_tick_timestamp_seconds` | — | Unix time the control loop last completed a tick; backs `/healthz` |
 | `unifand_build_info` | `version` | Always 1; join on `version` to identify the running build |
 
@@ -430,14 +474,20 @@ wholesale each tick and describe the latest tick only, so a signal that
 goes away disappears from the scrape rather than lingering at its last
 value.
 
+The self-test families are absent until first set: `unifand_full_rpm`
+(and its timestamp series) appear only after a settled full-duty
+measurement per channel, and `unifand_selftest_running` only when
+`[selftest] enabled = true`.
+
 `/healthz` (same port as `/metrics`) returns 200 while `now - unifand_last_tick_timestamp_seconds <= 3 * poll_interval_secs`, else 500 — this is what the DaemonSet's livenessProbe checks, so a wedged control loop (not just an unreachable metrics port) gets restarted.
 
 ### Monitoring
 
 [`contrib/`](contrib/) has a ready-to-import Grafana dashboard, a
-Prometheus/VictoriaMetrics alerting-rules file (nine rules covering the
+Prometheus/VictoriaMetrics alerting-rules file (twelve rules covering the
 failure modes above — hub missing, loop stuck, all sensors lost, fans
-stalled, sustained thermal throttling, etc.), and
+stalled, slow-at-full-duty, self-test stale, sustained thermal throttling,
+etc.), and
 scrape examples for prometheus-operator, the VictoriaMetrics operator, and
 plain annotation-based discovery. See [`contrib/README.md`](contrib/README.md).
 
@@ -517,6 +567,18 @@ Limitations. Both sensors read `None` forever, so `unifand_degraded=1`,
 behavior is safe (a constant duty is a sane dumb-fan-controller fallback)
 but closed-loop control simply isn't available on arm64 today.
 
+**Fans go to full speed for about a minute with no load.** This is the
+`[selftest]` sweep — it starts when no channel has a settled full-duty
+RPM measurement for `stale_after_h` (24 h by default), which on an
+otherwise-idle node is roughly daily. Confirm with
+`unifand_selftest_running` (goes 1 then 0) and the `selftest:` log lines
+(`selftest: full-tilt measurement stale; sweeping to 100% for …`, then
+`selftest: sweep finished; ramping down`). Make it rarer with a larger
+`stale_after_h` (the sweep also re-arms only after a new measurement is
+recorded), shorter with a smaller `duration_secs`, or off entirely with
+`[selftest] enabled = false` — passive full-duty recording then still
+happens whenever the curve itself pins 100%.
+
 ## How it works
 
 The SL V2 hub is a USB HID device. unifand finds it by scanning
@@ -581,6 +643,15 @@ but we ship one image.
 - LED animations are used only where they carry meaning (the alarm ladder);
   decorative effects (rainbow, meteor-for-fun) are deliberately out of scope —
   it's a gauge, not a light show.
+- One RPM reading per channel. A chained channel (multiple fans) is only as
+  observable as the hub's tach for it — the hub reports one RPM per channel,
+  so `unifand_fan_rpm`/`unifand_full_rpm` reflect the fan whose tach the
+  hub reads, not necessarily every fan in the chain.
+- The fan self-test never runs on a node in permanent sensor-loss fallback
+  (including arm64, per the item above) — those nodes emit no
+  `unifand_full_rpm` at all — and the staleness clock is in memory, so it
+  restarts with the pod: a pod that restarts more often than
+  `stale_after_h` never sweeps.
 
 ## License
 
