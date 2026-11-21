@@ -26,6 +26,10 @@
 # unifand_build_info{version}, unifand_last_tick_timestamp_seconds,
 # unifand_hub_present, unifand_degraded, unifand_fallback_active,
 # unifand_hid_errors_total{kind="read"|"write"}.
+# Fan self-test metrics (full-rpm series emitted passively whenever the
+# fans hold 100%, selftest_running only when [selftest] is enabled):
+# unifand_full_rpm{channel}, unifand_full_rpm_timestamp_seconds{channel},
+# unifand_selftest_running.
 # Multi-signal fusion metrics (only emitted with [signals] enabled = true),
 # verified against src/metrics.rs on the feat/multi-signal branch:
 # unifand_throttle_active{reason="sw_thermal"|"hw_thermal"|"hw_power_brake"|"sw_power_cap"},
@@ -149,6 +153,55 @@ groups:
             unplugged, or the hub may be ignoring commands while still
             answering RPM reads. Check airflow immediately — the daemon
             believes it is cooling.
+
+      # Fan self-test: full-tilt health. unifand_full_rpm is the RPM last
+      # measured with a channel settled at 100% duty (passively under load,
+      # or by a [selftest] sweep). 1800 is 90% of the 1995 rpm validated on
+      # the reference fans — tune per hardware. max_over_time means "every
+      # measurement in the window was low", so one bad reading among good
+      # ones does not fire; a brand-new series (pod restart) has only one.
+      # `and unifand_full_rpm` restricts it to series still being scraped,
+      # so a replaced pod's old readings stop alerting at once.
+      - alert: UnifandFanUnderperforming
+        expr: max_over_time(unifand_full_rpm[3d]) < 1800 and unifand_full_rpm
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "fan channel {{ $labels.channel }} is slow at full duty"
+          description: >-
+            Channel {{ $labels.channel }} has not exceeded 1800 rpm at 100%
+            duty in any measurement over the last 3 days. The fan still
+            turns (UnifandFanStalled covers stalls) but cannot reach full
+            speed: worn bearing, obstruction, or a failing fan. The hub
+            reports one RPM per channel, so on a chained channel this
+            reflects the fan whose tach the hub reads.
+
+      # The windows below assume the default stale_after_h = 24.
+      - alert: UnifandSelftestStale
+        expr: time() - unifand_full_rpm_timestamp_seconds > 3 * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "no full-duty RPM measurement for channel {{ $labels.channel }} in 3 days"
+          description: >-
+            Sweeps are not producing measurements: check for a persistent
+            sensor-loss fallback (sweeps are skipped), RPM read errors, or
+            [selftest] having been disabled.
+
+      - alert: UnifandSelftestNeverObserved
+        expr: unifand_selftest_running unless on (instance) unifand_full_rpm
+        for: 36h
+        labels:
+          severity: warning
+        annotations:
+          summary: "self-test enabled but nothing measured on {{ $labels.instance }}"
+          description: >-
+            [selftest] is enabled but no channel has produced a full-duty
+            measurement in 36 hours. The staleness clock restarts with the
+            pod, so a pod that restarts more often than stale_after_h never
+            sweeps.
 
       # Multi-signal fusion ([signals] enabled = true): sustained thermal
       # throttling. The throttle floor is a safety net, not a routine path
