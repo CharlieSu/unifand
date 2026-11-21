@@ -196,13 +196,11 @@ impl Metrics {
     /// RPM last measured with this channel settled at 100% duty, with the
     /// Unix time of that measurement. Insert-only: a channel that stops
     /// being measured keeps its last full-tilt reading on display.
-    #[allow(dead_code)] // wired into the tick loop by the self-test feature
     pub fn set_full_rpm(&self, ch: u8, rpm: u16, unix_secs: u64) {
         self.state().full_rpm.insert(ch, (rpm, unix_secs));
     }
     /// 1 while a self-test sweep is holding fans at 100%. Rendered only
     /// once set — its presence tells alert rules `[selftest]` is enabled.
-    #[allow(dead_code)] // wired into the tick loop by the self-test feature
     pub fn set_selftest_running(&self, v: bool) {
         self.state().selftest_running = Some(v);
     }

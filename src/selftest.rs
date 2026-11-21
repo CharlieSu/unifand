@@ -8,8 +8,6 @@
 //! the RPM reads (`observe`). Passive observation always runs, regardless
 //! of `SelftestConfig::enabled`; only the sweep is opt-in.
 
-#![allow(dead_code)]
-
 use crate::config::{SelftestConfig, SELFTEST_SETTLE_SECS};
 
 /// The constant duty a sweep drives the fans to.

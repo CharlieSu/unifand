@@ -475,6 +475,32 @@ fn main() -> Result<()> {
     // hub has lost whatever color state it had before the reset).
     let mut last_bucket: Option<u8> = None;
 
+    // Fan self-test (see src/selftest.rs). The machine owns all timing;
+    // the loop consults it before the decision block, at the plan/write,
+    // at the alarm input and after the RPM reads.
+    let mut selftest = selftest::SelfTest::new(&cfg.selftest);
+    let mut selftest_last_tick = Instant::now();
+    // Latest duty the controller decided. Equals last_applied except during
+    // a sweep, when last_applied is 100 and this keeps tracking the curve.
+    let mut curve_duty: Option<u8> = None;
+    // Duty last successfully written to the hub; None after a failed write
+    // or a re-init, until a write succeeds again.
+    let mut hub_duty: Option<u8> = None;
+    // Whether the previous tick's HID traffic was clean. Deliberately NOT
+    // `consecutive_errors == 0`: that counter is cleared only by a
+    // successful duty write or a re-init, so on an idle node holding steady
+    // duty one transient RPM read failure would leave it at 1 for hours
+    // and silently block every sweep.
+    let mut prev_tick_hid_ok = true;
+    if cfg.selftest.enabled {
+        log::info!(
+            "selftest: enabled (sweep to 100% for {}s once full-tilt measurement is stale for {}h)",
+            cfg.selftest.duration_secs,
+            cfg.selftest.stale_after_h
+        );
+        m.set_selftest_running(false);
+    }
+
     // Alarm ladder: pure state machine, built only when RGB is enabled (it
     // stays inert internally when cfg.rgb.alerts.enabled is false, so this is
     // the only gate needed). curve is non-empty per Config::validate().
@@ -525,6 +551,18 @@ fn main() -> Result<()> {
         }
         let (ctrl_t, degraded) = control_temp(temps.gpu, temps.cpu, cfg.cpu_offset);
         m.set_degraded(degraded);
+
+        // Self-test timers advance on wall-clock elapsed, like the alarm
+        // block below. A sweep reaching duration on this tick is ended here
+        // (before the decision block) so ctl.force() makes THIS tick's
+        // decide()/decide_target() take the first ramp-down step.
+        let st_now = Instant::now();
+        let st_elapsed = st_now.duration_since(selftest_last_tick).as_secs();
+        selftest_last_tick = st_now;
+        if selftest.begin_tick(st_elapsed) {
+            ctl.force(selftest::FULL_DUTY);
+            log::info!("selftest: sweep finished; ramping down");
+        }
 
         // THE ONE INVIOLABLE RULE: when `[signals]` is absent or disabled,
         // behavior is EXACTLY v0.5.1 — the `else` arm below is that code,
@@ -631,6 +669,32 @@ fn main() -> Result<()> {
         };
         m.set_fallback_active(fallback_active);
 
+        // Self-test decision for this tick: start/hold/abort the sweep and
+        // track the curve's duty (which the write below may override with
+        // 100 during a sweep).
+        if let Some(d) = decision {
+            curve_duty = Some(d);
+        }
+        let plan = selftest.plan(&selftest::PlanInputs {
+            fallback_active,
+            hub_healthy: prev_tick_hid_ok,
+            curve_duty,
+        });
+        match plan {
+            selftest::Plan::Start => log::info!(
+                "selftest: full-tilt measurement stale; sweeping to 100% for {}s",
+                cfg.selftest.duration_secs
+            ),
+            selftest::Plan::Abort => {
+                log::warn!("selftest: sweep aborted by sensor-loss fallback")
+            }
+            _ => {}
+        }
+        let sweeping = plan.sweeping();
+        if cfg.selftest.enabled {
+            m.set_selftest_running(sweeping);
+        }
+
         // Whether this tick's apply_duty call (if any) failed. Only this —
         // not a None decision — suppresses LED dispatch below: the hub is
         // likely unhealthy right after a failed write, so piling more writes
@@ -641,12 +705,14 @@ fn main() -> Result<()> {
         // NearLimit's speed escalation) would never reach the hub while the
         // system sits at its limit.
         let mut duty_write_failed = false;
-        if let Some(duty) = decision {
+        if let Some(duty) = selftest::write_duty(sweeping, decision, hub_duty) {
             last_applied = Some(duty);
             if apply_duty(&mut hub, &cfg.channels, duty, &m) {
+                hub_duty = Some(duty);
                 consecutive_errors = 0;
                 log::info!("duty -> {duty}% (control {:.1?}C)", ctrl_t);
             } else {
+                hub_duty = None;
                 consecutive_errors += 1;
                 duty_write_failed = true;
             }
@@ -739,7 +805,10 @@ fn main() -> Result<()> {
             last_tick = now;
             let inputs = AlarmInputs {
                 control_temp: ctrl_t,
-                duty: last_applied.unwrap_or(0),
+                // During a sweep the ladder is fed the curve's duty, not
+                // the 100 the hub is holding, so the sweep itself never
+                // escalates the ladder (real thermal triggers stay live).
+                duty: selftest::alarm_duty(sweeping, curve_duty, last_applied),
                 fallback_active,
             };
             if let Some(name) = machine.tick_with(&inputs, &thermal_hints, elapsed) {
@@ -749,9 +818,13 @@ fn main() -> Result<()> {
         m.set_led_state(alarm_machine.as_ref().map_or(0, |am| am.state_code()));
 
         let mut rpm_read_failed = false;
+        let mut rpm_ok: Vec<(u8, u16)> = Vec::new();
         for &c in &cfg.channels {
             match hub.read_rpm(c) {
-                Ok(rpm) => m.set_rpm(c, rpm),
+                Ok(rpm) => {
+                    m.set_rpm(c, rpm);
+                    rpm_ok.push((c, rpm));
+                }
                 Err(e) => {
                     log::warn!("rpm ch{c}: {e:#}");
                     m.inc_hid_errors_read();
@@ -759,6 +832,14 @@ fn main() -> Result<()> {
                 }
             }
         }
+        // Settled full-tilt sample? Record the channels that did read.
+        if selftest.observe(hub_duty, !rpm_read_failed) {
+            let now = now_unix_secs();
+            for (c, rpm) in &rpm_ok {
+                m.set_full_rpm(*c, *rpm, now);
+            }
+        }
+        prev_tick_hid_ok = !rpm_read_failed && !duty_write_failed;
         // Count at most once per tick, mirroring the write-failure accounting
         // above, so N failing channels don't multiply-count.
         if rpm_read_failed {
@@ -773,6 +854,12 @@ fn main() -> Result<()> {
                     Ok(mut h) => match h.init(&cfg.channels) {
                         Ok(()) => {
                             hub = h;
+                            // The fresh hub holds no duty state: forget
+                            // what we thought it was holding and restart
+                            // the settle clock so no RPM is recorded as
+                            // full-tilt until 100% is rewritten and settles.
+                            hub_duty = None;
+                            selftest.reset_settle();
                             m.set_hub_present(true);
                             log::info!("hub re-initialized at {}", p.display());
                             // Fresh hub has lost whatever LED state it had
@@ -791,6 +878,7 @@ fn main() -> Result<()> {
                             // is already at target).
                             match last_applied {
                                 Some(duty) if apply_duty(&mut hub, &cfg.channels, duty, &m) => {
+                                    hub_duty = Some(duty);
                                     consecutive_errors = 0;
                                     log::info!("duty {duty}% reapplied after re-init");
                                 }
