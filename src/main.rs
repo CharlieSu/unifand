@@ -4,6 +4,7 @@ mod curve;
 mod hid;
 mod metrics;
 mod rgb;
+mod selftest;
 mod sensors;
 mod signals;
 
