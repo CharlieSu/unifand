@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/) —
 with the pre-1.0 caveat that minor version bumps may carry breaking changes
 (protocol/metric shape changes), called out explicitly below.
 
+## [0.7.0](https://github.com/CharlieSu/unifand/compare/v0.6.6...v0.7.0) (2026-11-21)
+
+
+### Features
+
+* fan self-test — record full-tilt RPM, opt-in periodic 100% sweep ([#73](https://github.com/CharlieSu/unifand/issues/73)) ([ba6cd4c](https://github.com/CharlieSu/unifand/commit/ba6cd4ca088c26899d524bb702d70ec8a53f7d10))
+
+
+### Bug Fixes
+
+* **deps:** update rust docker tag to v1.100.0 ([#71](https://github.com/CharlieSu/unifand/issues/71)) ([79e69bf](https://github.com/CharlieSu/unifand/commit/79e69bfdea5fe7bef39dcdf6cc54842c9f241336))
+
 ## [0.6.6](https://github.com/CharlieSu/unifand/compare/v0.6.5...v0.6.6) (2026-11-05)
 
 
